@@ -1,0 +1,80 @@
+{
+  "onebot": {
+    "wsUrl": "ws://127.0.0.1:3001",
+    "token": "你的-OneBot-token（与 NapCat onebot11_<QQ号>.json 里的 websocketServers[].token 一致）"
+  },
+  "bot": {
+    "selfId": "机器人QQ号",
+    "nickname": "企鹅主任",
+    "atAliases": [
+      "机器人昵称",
+      "机器人群名片",
+      "机器人QQ号"
+    ],
+    "owner": "你的QQ号（最高权限）",
+    "whitelist": [
+      "你的QQ号"
+    ],
+    "maxConcurrent": 3,
+    "timeoutMs": 240000,
+    "defaultGroup": "默认群号"
+  },
+  "pi": {
+    "command": "node",
+    "args": [
+      "/绝对路径/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+      "-p",
+      "--approve"
+    ],
+    "thinking": "minimal",
+    "tavilyKey": "你的-Tavily-API-key（https://tavily.com 免费额度）",
+    "defaultModel": "deepseek-flash",
+    "models": {
+      "deepseek-flash": "deepseek-flash",
+      "glm": "aliyun-maas/glm-5.3"
+    },
+    "aliyunKey": "你的阿里云百炼-API-key",
+    "aliyunBaseUrl": "你的百炼实例地址（形如 https://<实例id>.cn-beijing.maas.aliyuncs.com/compatible-mode/v1）"
+  },
+  "antispam": {
+    "enabled": true,
+    "windowMs": 90000,
+    "minRepeats": 3,
+    "noticeText": "本群禁止刷屏行为",
+    "exemptUsers": [
+      "你的QQ号"
+    ]
+  },
+  "memory": {
+    "enabled": true,
+    "windowMs": 300000,
+    "summarizeMinBytes": 1024
+  },
+  "tasks": [
+    {
+      "name": "零点当日课表",
+      "time": "00:00",
+      "enabled": true,
+      "target": {
+        "type": "group",
+        "id": "1126132535"
+      },
+      "prompt": "现在是当天 00:00。调用 schedule_query 查询「今天」（即任务触发当日）的课表，然后把当天课程信息发到群 1126132535：按节次列出时间、课程名称、地点；如果当天没有课，就直接发一句「今天没有课」。纯文本，不要 Markdown，内容简短清楚。"
+    }
+  ],
+  "jw": {
+    "user": "教务系统账号（学号）",
+    "password": "教务系统密码",
+    "xnm": "2026",
+    "xqm": "3",
+    "className": "你的班级（如（2）班）",
+    "periodTimes": {
+      "1": "08:25",
+      "3": "10:20",
+      "5": "14:00",
+      "7": "15:50",
+      "8": "16:45",
+      "9": "18:30"
+    }
+  }
+}

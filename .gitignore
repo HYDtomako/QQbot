@@ -1,0 +1,34 @@
+# 依赖
+node_modules/
+
+# ── 私密配置（务必不要提交）────────────────────────────
+# 里面含 OneBot token、各模型 API key、教务系统账号密码
+config.json
+.model-state.json
+
+# ── 运行时数据与个人隐私 ───────────────────────────────
+# 聊天记录、群成员名册、长期记忆、群聊日志 —— 含真实 QQ 号与对话内容
+memory/
+# 群成员名册（QQ 号/名片/入群时间）
+sandbox/.roster/
+# 用户发来的图片/文件副本
+sandbox/attachments/
+# 个人课表缓存与渲染图（课程/教室/老师）
+schedule/cache.json
+schedule/week-*.png
+schedule/preview*.png
+# 第三方加密脚本（来自教务系统，不随仓库分发）
+schedule/vendor/
+
+# ── 临时与调试产物 ─────────────────────────────────────
+*.log
+debug-events.jsonl
+power*.txt
+merge-prompt.txt
+tmp-dll/
+NapCat*.zip
+.zcode/
+
+# ── 系统 ───────────────────────────────────────────────
+.DS_Store
+Thumbs.db
