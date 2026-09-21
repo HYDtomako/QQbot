@@ -1,0 +1,14 @@
+{
+  "name": "pi-napcatqq-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "QQ bot bridge: NapCatQQ (OneBot 11) -> pi coding agent",
+  "scripts": {
+    "bot": "node src/main.ts"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "^1.0.9",
+    "ws": "^8.21.3"
+  }
+}
