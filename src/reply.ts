@@ -25,7 +25,14 @@ export function splitText(text: string, maxLen: number = MAX_SEGMENT_LEN): strin
   return parts;
 }
 
-export const CARD_NODE_LEN = 200; // 群聊卡片里单条消息的目标长度，超出就分成多条
+export const CARD_NODE_LEN = 500; // 群聊卡片里单条消息的目标字数：超过就按这个字数分段
+
+/** 返回窗口内最后一个空行之后的位置（找不到返回 -1）。 */
+function lastBlankLine(win: string): number {
+  let cut = -1;
+  for (const m of win.matchAll(/\n[ \t]*\n/g)) cut = m.index! + m[0].length;
+  return cut;
+}
 
 /** 返回窗口内最后一个句末标点之后的位置（找不到返回 -1）。 */
 function lastSentenceEnd(win: string): number {
@@ -35,45 +42,46 @@ function lastSentenceEnd(win: string): number {
   return cut;
 }
 
-/** 把一段过长的文本按换行/句末标点切成不超长的片段，都没有就退到空格、再没有才硬切。 */
+/**
+ * 把长文按 maxLen 字数切段：每段尽量写满，只在上限附近挑一个体面的断点
+ * （空行 → 换行 → 句末标点 → 空格），都没有才硬切。
+ */
 function splitLong(s: string, maxLen: number): string[] {
   const out: string[] = [];
   let rest = s.trim();
+  const floor = maxLen * 0.5; // 断点太靠前就不认，保证每段都接近目标字数
   while (rest.length > maxLen) {
     const win = rest.slice(0, maxLen);
-    const floor = maxLen * 0.3; // 断点太靠前不如继续往后找，避免切出只有几个字的碎片
+    const blank = lastBlankLine(win);
     const nl = win.lastIndexOf("\n");
     const sent = lastSentenceEnd(win);
     const sp = win.lastIndexOf(" ");
     const cut =
-      nl >= floor ? nl + 1 : sent >= floor ? sent : sp >= maxLen * 0.6 ? sp + 1 : maxLen;
+      blank >= floor ? blank
+      : nl >= floor ? nl + 1
+      : sent >= floor ? sent
+      : sp >= floor ? sp + 1
+      : maxLen;
     out.push(rest.slice(0, cut).trim());
     rest = rest.slice(cut).replace(/^\s+/, "");
   }
-  if (rest) out.push(rest);
+  if (rest) {
+    // 尾巴太短就并回上一段，避免冒出一条只有几个字的消息
+    const last = out[out.length - 1];
+    if (last && rest.length < maxLen * 0.3) out[out.length - 1] = `${last}\n${rest}`;
+    else out.push(rest);
+  }
   return out;
 }
 
 /**
- * 群聊"聊天记录"卡片的分条：按空行 → 换行 → 句末标点的优先级断开，
- * 让回复落成若干条短消息，而不是一整段塞进一条。
+ * 群聊"聊天记录"卡片的分条：一大段文字按固定字数（CARD_NODE_LEN）切成几条，
+ * 不超过字数就不分，私聊不走这里。
  */
 export function splitForCard(text: string, maxLen: number = CARD_NODE_LEN): string[] {
-  const nodes: string[] = [];
-  const push = (piece: string): void => {
-    const t = piece.trim();
-    if (!t) return;
-    const last = nodes[nodes.length - 1];
-    // 太短的尾巴并回上一条，避免冒出一条只有几个字的消息
-    if (last && t.length < 20 && last.length + t.length < maxLen) nodes[nodes.length - 1] = `${last}\n${t}`;
-    else nodes.push(t);
-  };
-  for (const para of text.split(/\n\s*\n/)) {
-    for (const line of para.split("\n")) {
-      for (const piece of line.length > maxLen ? splitLong(line, maxLen) : [line]) push(piece);
-    }
-  }
-  return nodes.length ? nodes : [text.trim()];
+  const t = text.trim();
+  if (!t) return [text];
+  return t.length <= maxLen ? [t] : splitLong(t, maxLen);
 }
 
 /** 把回复组装成适合 QQ 发送的消息段列表（群聊先 @ 提问者）。 */
