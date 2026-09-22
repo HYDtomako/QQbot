@@ -7,7 +7,7 @@ import { OneBotClient, type MessageSegment } from "./onebot.ts";
 import { matchMessage, type TriggeredMessage } from "./router.ts";
 import { createAttachments } from "./attachments.ts";
 import { PiRunner } from "./runner.ts";
-import { buildReply, splitText, textSegment } from "./reply.ts";
+import { buildReply, splitForCard, splitText, textSegment } from "./reply.ts";
 import { Antispam } from "./antispam.ts";
 import { TaskScheduler } from "./tasks.ts";
 import { ensureSchedule, answerDay, setClassFilter, readCache, type ScheduleBundle } from "../schedule/zf.ts";
@@ -609,7 +609,8 @@ async function handleTrigger(trigger: TriggeredMessage): Promise<void> {
 
   // 群聊：回复打包成一条"聊天记录"卡片（send_forward_msg，单次调用单条消息）
   if (trigger.kind === "group") {
-    const chunks = splitText(text);
+    // 卡片内同样分成多条短消息，避免一条里塞一大段
+    const chunks = splitForCard(text);
     const nodes = chunks.map((chunk, i) => ({
       userId: Number(config.bot.selfId),
       nickname: config.bot.nickname,
