@@ -323,7 +323,8 @@ const taskScheduler = new TaskScheduler(
   {
     runSchedule: (prompt) =>
       runner.run(
-        `[定时任务] 以下是院长预先设置并已授权的定时任务，直接执行，不要因为看不到发送者身份信息而拒绝：\n${prompt}`,
+        `[定时任务] 以下是院长预先设置并已授权的定时任务，直接执行，不要因为看不到发送者身份信息而拒绝。\n` +
+          `注意：你的最终输出会被系统自动发送到目标群/私聊，**直接输出内容即可，不要再调用 send_group_message 等发送类工具**（否则会重复发送）。\n${prompt}`,
         { mode: "web", model: modelRegistry[currentModel], priority: "scheduled" },
       ),
     sendTo: async (target, text) => {
