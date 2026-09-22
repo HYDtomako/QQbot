@@ -1,4 +1,22 @@
 @echo off
-REM å¯åŠ¨ pi-NapCatQQ æ¡¥æŽ¥æœåŠ¡ï¼ˆéœ€å…ˆå¯åŠ¨ NapCatï¼‰
-cd /d %~dp0
-node src/main.ts
+REM ÇÅ½Ó·þÎñºóÌ¨Æô¶¯Æ÷£ºÁ¬½Ó³É¹¦ºó±¾´°¿Ú×Ô¶¯¹Ø±Õ.
+set LOG=D:\pi-napcatqq\log-bot.txt
+echo ÕýÔÚÇåÀí¾ÉÇÅ½Ó½ø³Ì£¨·ÀÖ¹ÖØ¸´»Ø¸´£©...
+powershell -NoProfile -EncodedCommand RwBlAHQALQBDAGkAbQBJAG4AcwB0AGEAbgBjAGUAIABXAGkAbgAzADIAXwBQAHIAbwBjAGUAcwBzACAALQBGAGkAbAB0AGUAcgAgACIATgBhAG0AZQA9ACcAbgBvAGQAZQAuAGUAeABlACcAIgAgAHwAIABXAGgAZQByAGUALQBPAGIAagBlAGMAdAAgAHsAIAAkAF8ALgBDAG8AbQBtAGEAbgBkAEwAaQBuAGUAIAAtAG0AYQB0AGMAaAAgACcAbQBhAGkAbgBcAC4AdABzACcAIAB9ACAAfAAgAEYAbwByAEUAYQBjAGgALQBPAGIAagBlAGMAdAAgAHsAIABTAHQAbwBwAC0AUAByAG8AYwBlAHMAcwAgAC0ASQBkACAAJABfAC4AUAByAG8AYwBlAHMAcwBJAGQAIAAtAEYAbwByAGMAZQAgAH0A
+wscript.exe "%~dp0pi-bot-start-bridge.vbs"
+echo ÕýÔÚÆô¶¯ÇÅ½Ó·þÎñ²¢µÈ´ýÁ¬½Ó£¨Èô NapCat Î´Æô¶¯£¬ÇëÏÈÔËÐÐ start-napcat.bat£©...
+for /l %%i in (1,1,150) do (
+  timeout /t 2 /nobreak >nul
+  netstat -ano | findstr ":3001" | findstr "ESTABLISHED" >nul 2>&1 && goto ok
+  cls
+  powershell -NoProfile -Command "Get-Content -Tail 12 -Encoding UTF8 '%LOG%'"
+)
+echo.
+echo µÈ´ý³¬Ê±£ºÇëÈ·ÈÏ NapCat ÒÑÆô¶¯£¬»ò°Ñ±¾´°¿ÚÊä³ö·¢¸øÎ¬»¤Õß.
+pause
+exit
+:ok
+echo.
+echo Á¬½Ó³É¹¦£¡ÇÅ½ÓÒÑ×ªÈëºóÌ¨ÔËÐÐ£¬±¾´°¿Ú 2 Ãëºó×Ô¶¯¹Ø±Õ.
+timeout /t 2 /nobreak >nul
+exit

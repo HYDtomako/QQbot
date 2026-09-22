@@ -20,6 +20,13 @@ schedule/preview*.png
 # 第三方加密脚本（来自教务系统，不随仓库分发）
 schedule/vendor/
 
+# ── 含机器人QQ号 / 本机专属（勿提交）──────────────────
+# 真实文件仅本机使用；仓库里保留 start-napcat.example.bat 模板
+start-napcat.bat
+pi-bot-start-napcat.vbs
+# 运行日志（含 QQ 号与消息信息；上面的 *.log 盖不住 .txt 后缀）
+log-*.txt
+
 # ── 临时与调试产物 ─────────────────────────────────────
 *.log
 debug-events.jsonl
