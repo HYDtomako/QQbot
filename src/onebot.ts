@@ -183,19 +183,23 @@ export class OneBotClient {
     }
   }
 
-  /** 取文件：返回本地路径 / base64 / 下载链接（NapCat get_file 接口）。 */
-  async getFile(fileId: string): Promise<{ path?: string; base64?: string; url?: string } | null> {
+  /**
+   * 取文件：返回本地路径 / base64 / 下载链接（NapCat get_file 接口）。
+   * 同时回带 file_name —— 消息段里没文件名时（引用消息常见）靠它判类型。
+   */
+  async getFile(fileId: string): Promise<{ path?: string; base64?: string; url?: string; name?: string } | null> {
     try {
       const res = await this.call("get_file", { file_id: fileId });
-      const data = res.data as { file?: string; url?: string } | undefined;
+      const data = res.data as { file?: string; url?: string; file_name?: string } | undefined;
+      const name = typeof data?.file_name === "string" && data.file_name ? data.file_name : undefined;
       const f = data?.file;
       if (typeof f === "string" && f) {
-        if (f.startsWith("base64://")) return { base64: f.slice("base64://".length) };
-        if (/^https?:\/\//i.test(f)) return { url: f };
-        return { path: f };
+        if (f.startsWith("base64://")) return { base64: f.slice("base64://".length), name };
+        if (/^https?:\/\//i.test(f)) return { url: f, name };
+        return { path: f, name };
       }
-      if (typeof data?.url === "string" && data.url) return { url: data.url };
-      return null;
+      if (typeof data?.url === "string" && data.url) return { url: data.url, name };
+      return name ? { name } : null;
     } catch {
       return null;
     }

@@ -35,6 +35,20 @@ export interface TriggeredMessage {
 }
 
 /**
+ * 取"文件"段里的原始文件名。NapCat 的字段名不统一：
+ * 实时消息与 get_msg 历史消息里常用 `file` 放文件名，部分版本用 `file_name` / `name`。
+ * `file` 也可能是带目录的本地路径，故只取末段。
+ */
+export function pickFileName(data: Record<string, unknown> | undefined): string | undefined {
+  for (const v of [data?.file_name, data?.name, data?.file]) {
+    if (typeof v !== "string") continue;
+    const name = v.trim().split(/[\\/]/).pop()!.trim();
+    if (name) return name;
+  }
+  return undefined;
+}
+
+/**
  * 判断一条 OneBot 消息事件是否应触发 pi：
  * - 私聊：发送者在白名单内直接触发；
  * - 群聊：消息 @ 了机器人（at 段或文本形式的 @）即触发；
@@ -72,12 +86,9 @@ export function matchMessage(
         url: typeof seg.data?.url === "string" ? seg.data.url : undefined,
       });
     } else if (seg.type === "file") {
-      // NapCat 的字段名不统一：file_name / name / file（收到消息时常用 file 放文件名）
-      const nameCandidates = [seg.data?.file_name, seg.data?.name, seg.data?.file];
-      const picked = nameCandidates.find((v) => typeof v === "string" && v.trim() !== "") as string | undefined;
       files.push({
         fileId: typeof seg.data?.file_id === "string" ? seg.data.file_id : undefined,
-        name: picked,
+        name: pickFileName(seg.data),
         url: typeof seg.data?.url === "string" ? seg.data.url : undefined,
         size: Number(seg.data?.file_size ?? 0) || undefined,
       });
