@@ -5,7 +5,7 @@ import { mkdirSync, writeFileSync, existsSync, readFileSync, statSync, renameSyn
 import { loadConfig } from "./config.ts";
 import { OneBotClient, type MessageSegment } from "./onebot.ts";
 import { matchMessage, type TriggeredMessage } from "./router.ts";
-import { createAttachments } from "./attachments.ts";
+import { createAttachments, type MaterializedFile } from "./attachments.ts";
 import { PiRunner } from "./runner.ts";
 import { buildReply, splitForCard, splitText, textSegment } from "./reply.ts";
 import { Antispam } from "./antispam.ts";
@@ -549,7 +549,9 @@ async function handleTrigger(trigger: TriggeredMessage): Promise<void> {
   const task = prev.catch(() => undefined).then(async () => {
     const { file, summary } = await memorySessionFor(trigger.userId);
     const { images, files } = await attachments.collect(trigger);
-    const { paths: filePaths, rejected } = files.length ? await attachments.materializeFiles(files) : { paths: [], rejected: [] };
+    const { files: readyFiles, rejected } = files.length
+      ? await attachments.materializeFiles(files)
+      : { files: [], rejected: [] };
     // 长期记忆：只注入本人条目，按相关性挑选（核心 + 相关 + 最近），总量封顶
     const sel = selectMemories(trigger.userId, trigger.text);
     const memoBlock = sel.lines.length
@@ -558,7 +560,7 @@ async function handleTrigger(trigger: TriggeredMessage): Promise<void> {
     const prompt =
       memoBlock +
       (summary ? `[此前与该用户的对话摘要（更早内容已压缩）]\n${summary}\n\n` : "") +
-      (await buildPrompt(trigger, images.length, filePaths.map((p) => path.basename(p)), rejected));
+      (await buildPrompt(trigger, images.length, readyFiles, rejected));
     // 超量时后台自动合并（不阻塞本次回复）
     maybeMergeMemories(trigger.userId).catch(() => {});
     const imagePaths = images.length ? await attachments.materializeImages(images) : [];
@@ -566,7 +568,7 @@ async function handleTrigger(trigger: TriggeredMessage): Promise<void> {
       mode: "web",
       model: modelRegistry[currentModel],
       sessionFile: file,
-      imagePaths: [...imagePaths, ...filePaths],
+      imagePaths: [...imagePaths, ...readyFiles.map((f) => f.path)],
     });
   });
   pendingByUser.set(trigger.userId, task);
@@ -676,7 +678,7 @@ function stripMarkdown(s: string): string {
 async function buildPrompt(
   trigger: TriggeredMessage,
   imageCount = 0,
-  fileNameList: string[] = [],
+  fileList: MaterializedFile[] = [],
   rejectedFiles: string[] = [],
 ): Promise<string> {
   const roleStr = trigger.senderRole ? `，${ROLE_NAMES[trigger.senderRole] ?? trigger.senderRole}` : "";
@@ -686,7 +688,10 @@ async function buildPrompt(
       : `${trigger.senderName ? `「${trigger.senderName}」` : "群友"}（QQ ${trigger.userId}${roleStr}）`;
   const notes: string[] = [];
   if (imageCount) notes.push(`${imageCount} 张图片（在附件里，可直接查看图片内容）`);
-  if (fileNameList.length) notes.push(`文本文件 ${fileNameList.join("、")}（在附件里，可直接读取内容）`);
+  if (fileList.length) {
+    const desc = fileList.map((f) => (f.note ? `${f.name}（${f.note}）` : f.name)).join("、");
+    notes.push(`文件 ${desc}（在附件里，可直接读取内容）；若转换有损（表格错位、扫描件无文字等），如实说明`);
+  }
   if (rejectedFiles.length) notes.push(`${rejectedFiles.join("；")} —— 这些文件你读不了，请如实说明`);
   const imgNote = notes.length ? `（附件说明：${notes.join("；")}）` : "";
   if (trigger.kind === "private") {
@@ -754,8 +759,15 @@ async function refreshScheduleAll(): Promise<void> {
   }
 }
 
-// ── 附件（图片/文本文件）：落地逻辑见 ./attachments.ts，供 pi 以 @路径 读取 ──
-const attachments = createAttachments({ client, dir: path.join(sandboxDir, "attachments"), log });
+// ── 附件（图片/文件）：落地与文档取文见 ./attachments.ts 与 ./docparse.ts，供 pi 以 @路径 读取 ──
+const attachments = createAttachments({
+  client,
+  dir: path.join(sandboxDir, "attachments"),
+  log,
+  maxTextChars: config.files?.maxTextChars,
+  maxTotalChars: config.files?.maxTotalChars,
+  pdftotext: config.files?.pdftotext,
+});
 
 // ── 长期记忆：按相关性注入（控 token）+ 超量自动合并（控条数）──
 const longTermDir = path.join(root, "memory", "long-term");
