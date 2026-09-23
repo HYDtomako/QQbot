@@ -50,6 +50,11 @@
     "windowMs": 300000,
     "summarizeMinBytes": 1024
   },
+  "files": {
+    "maxTextChars": 30000,
+    "maxTotalChars": 60000,
+    "pdftotext": "留空自动查找（PATH、Git for Windows 的 mingw64/bin）；找不到时 PDF 读不了，可填完整路径"
+  },
   "tasks": [
     {
       "name": "示例任务（可删）",

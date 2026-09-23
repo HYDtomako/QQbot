@@ -34,6 +34,15 @@ export interface BotConfig {
     windowMs?: number;
     summarizeMinBytes?: number;
   };
+  /** 附件（图片/文件）处理参数 */
+  files?: {
+    /** 单个文件的文本上限（字符），超出截断，默认 30000 */
+    maxTextChars?: number;
+    /** 单条消息所有附件的文本总量上限（字符），默认 60000 */
+    maxTotalChars?: number;
+    /** pdftotext 可执行文件路径（默认从 PATH 与 Git for Windows 目录自动查找） */
+    pdftotext?: string;
+  };
   tasks?: Array<{
     name: string;
     time: string; // HH:MM 每日触发

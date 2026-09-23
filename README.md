@@ -15,6 +15,12 @@ QQ 群/私聊 ──► NapCatQQ（OneBot 11 正向 WebSocket :3001）
 
 - **定位**：知识服务型助手——答疑解惑、信息输出、知识总结、建议提供；不涉及 coding，无 shell/文件工具。
 - **能力**：所有人统一只有 `web_search`（Tavily 搜索）+ `web_read`（读网页，国内站直连；不访问外网）；`--tools` 白名单硬限制，碰不到本地文件和命令。
+- **文件读取**（`src/attachments.ts` + `src/docparse.ts`）：发来的文件先转成文本再交给 pi（pi 的附件只认图片与文本，二进制文档必须先取文）。
+  - 纯文本（txt/md/csv/json/yaml/xml/ini/字幕等）：原样读，UTF-8 / GBK / UTF-16 自动识别。
+  - PDF：调 `pdftotext` 取文，分页处插入页码标记；扫描件提取不到文字时如实回复，不编内容。
+  - Word / Excel / PPT（docx/xlsx/pptx）：本地解压 OOXML 取文——Word 标题转 Markdown 标题、表格同一行用制表符对齐；Excel 多工作表分别列出、日期序列号还原成日期；PPT 按页分块。
+  - 图片走多模态直接看；压缩包、音视频、旧版 doc/xls/ppt 会如实回复读不了（并提示另存为 docx/pdf）。
+  - 上下文闸门：单文件文本上限 30000 字、单条消息 60000 字、单条消息最多 5 个文件（超出截断或拒绝，参数在 `config.json` 的 `files`）。
 - **权限（说话层）**：只认 QQ 号（`config.bot.owner`，配置里指定），与任何群身份无关；主人的指令绝对优先，其他人仅可提问。
 - **触发规则**：私聊仅白名单（`bot.whitelist`）触发；群聊任何人 @ 机器人即可（真 at 或文本 @ 均可，光 @ 不说话也会回应）。
 - **人设**：`sandbox/.pi/SYSTEM.md`（企鹅主任），改动后下一条消息自动生效。
@@ -59,6 +65,7 @@ QQ 群/私聊 ──► NapCatQQ（OneBot 11 正向 WebSocket :3001）
   - `pi.tavilyKey`：Tavily 搜索 key；`pi.aliyunKey` / `pi.aliyunBaseUrl`：百炼实例（用 GLM 时需要）
   - `jw`：教务系统账号/密码/学年学期/班级/节次时间（课表功能用）
   - `antispam` / `memory`：反刷屏与记忆参数
+  - `files`：附件处理参数（`maxTextChars` 单文件文本上限、`maxTotalChars` 单条消息总量、`pdftotext` 可执行文件路径）
 - NapCat OneBot 网络：`<NapCat目录>\napcat\config\onebot11_<QQ号>.json`（启用正向 WS，端口与 config 一致，改后热重载）。
 - 两端 token 必须一致：`config.json` 的 `onebot.token` 与 OneBot 配置里 `websocketServers[0].token` 相同。
 
@@ -66,6 +73,7 @@ QQ 群/私聊 ──► NapCatQQ（OneBot 11 正向 WebSocket :3001）
 
 - **Node ≥ 22.19**（用到原生 TS 运行与 `--experimental` 特性）。
 - **pi**：`npm i -g @earendil-works/pi-coding-agent`。Windows 上若 Git 不在默认路径，需在 `~/.pi/agent/settings.json` 里设 `shellPath` 指向 `bash.exe`。
+- **pdftotext**（读 PDF 用）：Git for Windows 自带（`<Git安装目录>/mingw64/bin/pdftotext.exe`），桥接会从 PATH 与 Git 安装目录自动查找；找不到时 PDF 会如实回复读不了，可在 `config.json` 的 `files.pdftotext` 指定完整路径。Word/Excel/PPT 不需要外部工具。
 - **NapCatQQ**：Shell 版解压即用；若启动报 `wrapper.node` 加载失败，从 QQ 安装包的 `Files/versions/*/resources/app/` 提取 `crypto.dll`、`ssl.dll`、`dbghelp.dll` 放入 NapCat 目录。
 - **课表的加密脚本**：`schedule/vendor/` 下的 jsbn/rsa 等文件来自教务系统页面（不随仓库分发）。首次使用课表功能前，从教务系统登录页引用的路径下载：
   `http://<教务系统域名>/zftal-ui-v5-1.0.2/assets/plugins/crypto/rsa/{jsbn,prng4,rng,rsa,base64}.js`
@@ -73,6 +81,16 @@ QQ 群/私聊 ──► NapCatQQ（OneBot 11 正向 WebSocket :3001）
 ### 网络访问范围
 
 机器人**不访问外网**：`web_read` 直连国内站点，境外站点（YouTube、X、OpenAI 等）读不到，会如实说明并改用搜索找替代信息。搜索（Tavily）走直连。所有输出经统一脱敏（密钥不外泄）。
+
+### 文档取文回归
+
+`src/docparse.ts`（PDF/Word/Excel/PPT 取文）可以脱离 bot 进程直接验证，改动后建议拿几个真实文件跑一遍：
+
+```bash
+node scripts/docparse-selftest.ts [-v] 文件1 文件2 ...
+```
+
+输出每个文件是否读成文本、字符数、转换说明与耗时；`-v` 会打印正文预览，用来检查表格是否对得齐、日期是否还原、PDF 分页标记是否正常。
 
 ### 注意
 

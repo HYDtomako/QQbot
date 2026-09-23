@@ -5,7 +5,8 @@
   "type": "module",
   "description": "QQ bot bridge: NapCatQQ (OneBot 11) -> pi coding agent",
   "scripts": {
-    "bot": "node src/main.ts"
+    "bot": "node src/main.ts",
+    "selftest:docparse": "node scripts/docparse-selftest.ts"
   },
   "dependencies": {
     "@napi-rs/canvas": "^1.0.9",
