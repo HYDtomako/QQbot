@@ -47,7 +47,9 @@ const READ_SCHEMA = {
 
 const FETCH_TIMEOUT_MS = 20_000;
 const MAX_BODY_BYTES = 3 * 1024 * 1024;
-const MAX_TEXT_CHARS = 15_000;
+// 正文上限（字符）：技术长文动辄三四万字，太小会拦腰截断读不完整
+const DEFAULT_MAX_TEXT_CHARS = 50_000;
+const MAX_TEXT_CHARS = envMaxTextChars() ?? DEFAULT_MAX_TEXT_CHARS;
 
 // IP 回显/查询类网站：访问它们会拿到本机出口 IP，属信息安全红线，一律拒绝
 const IP_ECHO_HOSTS = [
@@ -169,8 +171,16 @@ export default function webToolsExtension(pi: ExtensionAPI) {
   });
 }
 
+/** config.json 的 web.maxTextChars 经 WEB_MAX_TEXT_CHARS 注入；非法值按缺省处理。 */
+function envMaxTextChars(): number | undefined {
+  const n = Number(process.env.WEB_MAX_TEXT_CHARS ?? "");
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+}
+
 function clip(body: string): string {
-  return body.length > MAX_TEXT_CHARS ? body.slice(0, MAX_TEXT_CHARS) + "\n\n(正文过长，已截断)" : body;
+  if (body.length <= MAX_TEXT_CHARS) return body;
+  const note = `\n\n(正文过长，已截断：全文约 ${body.length} 字，以上为前 ${MAX_TEXT_CHARS} 字)`;
+  return body.slice(0, MAX_TEXT_CHARS) + note;
 }
 
 function text(t: string): ToolResult {

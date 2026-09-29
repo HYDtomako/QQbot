@@ -24,6 +24,7 @@ const piEnv = {
   ...(config.pi.tavilyKey ? { TAVILY_API_KEY: config.pi.tavilyKey } : {}),
   ...(config.pi.aliyunKey ? { ALIYUN_MAA_API_KEY: config.pi.aliyunKey } : {}),
   ...(config.pi.aliyunBaseUrl ? { ALIYUN_MAA_BASE_URL: config.pi.aliyunBaseUrl } : {}),
+  ...(config.web?.maxTextChars ? { WEB_MAX_TEXT_CHARS: String(config.web.maxTextChars) } : {}),
 };
 const runner = new PiRunner({
   command: config.pi.command,

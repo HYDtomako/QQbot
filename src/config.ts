@@ -43,6 +43,11 @@ export interface BotConfig {
     /** pdftotext 可执行文件路径（默认从 PATH 与 Git for Windows 目录自动查找） */
     pdftotext?: string;
   };
+  /** 联网工具（web_search / web_read）参数 */
+  web?: {
+    /** web_read 单页正文上限（字符），超出截断，默认 50000 */
+    maxTextChars?: number;
+  };
   tasks?: Array<{
     name: string;
     time: string; // HH:MM 每日触发

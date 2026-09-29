@@ -14,7 +14,7 @@ QQ 群/私聊 ──► NapCatQQ（OneBot 11 正向 WebSocket :3001）
 ## 功能与安全
 
 - **定位**：知识服务型助手——答疑解惑、信息输出、知识总结、建议提供；不涉及 coding，无 shell/文件工具。
-- **能力**：所有人统一只有 `web_search`（Tavily 搜索）+ `web_read`（读网页，国内站直连；不访问外网）；`--tools` 白名单硬限制，碰不到本地文件和命令。
+- **能力**：所有人统一只有 `web_search`（Tavily 搜索）+ `web_read`（读网页，国内站直连；不访问外网）；`--tools` 白名单硬限制，碰不到本地文件和命令。`web_read` 单页正文上限 50000 字（约够读完一篇三四万字的技术长文），超出才截断并在末尾标注全文字数；上限可在 `config.json` 的 `web.maxTextChars` 调整。
 - **文件读取**（`src/attachments.ts` + `src/docparse.ts`）：发来的文件先转成文本再交给 pi（pi 的附件只认图片与文本，二进制文档必须先取文）。
   - 纯文本（txt/md/csv/json/yaml/xml/ini/字幕等）：原样读，UTF-8 / GBK / UTF-16 自动识别。
   - PDF：调 `pdftotext` 取文，分页处插入页码标记；扫描件提取不到文字时如实回复，不编内容。
@@ -66,6 +66,7 @@ QQ 群/私聊 ──► NapCatQQ（OneBot 11 正向 WebSocket :3001）
   - `jw`：教务系统账号/密码/学年学期/班级/节次时间（课表功能用）
   - `antispam` / `memory`：反刷屏与记忆参数
   - `files`：附件处理参数（`maxTextChars` 单文件文本上限、`maxTotalChars` 单条消息总量、`pdftotext` 可执行文件路径）
+  - `web`：联网工具参数（`maxTextChars` 单页正文上限，默认 50000，超出截断并标注全文字数）
 - NapCat OneBot 网络：`<NapCat目录>\napcat\config\onebot11_<QQ号>.json`（启用正向 WS，端口与 config 一致，改后热重载）。
 - 两端 token 必须一致：`config.json` 的 `onebot.token` 与 OneBot 配置里 `websocketServers[0].token` 相同。
 
