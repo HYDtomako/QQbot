@@ -86,7 +86,7 @@ export class PiRunner {
   private execute(job: Job): Promise<PiResult> {
     const started = Date.now();
     const args = [...this.opts.args];
-    // 工具分级：full=全部工具；web=联网搜索/读链接 + 群名册 + 课表 + 群聊总结 + 定时任务 + 长期记忆 + 时间 + 给咕嘎一号带话（无本地文件/命令）
+    // 工具分级：full=全部工具；web=联网搜索/读链接 + 群名册 + 课表 + 群聊总结 + 定时任务 + 长期记忆 + 时间 + 给本机个人助手带话（无本地文件/命令）
     if (job.mode === "web")
       args.push(
         "--tools",

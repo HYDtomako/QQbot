@@ -954,7 +954,7 @@ async function flushOutbox(): Promise<void> {
   }
 }
 
-// ── 与咕嘎一号的通信桥：读 memory/bridge/to-qq.jsonl，真发到 QQ（与发件箱同一机制）──
+// ── 与本机个人助手的通信桥：读 memory/bridge/to-qq.jsonl，真发到 QQ（与发件箱同一机制）──
 const bridgeOutPath = path.join(root, "memory", "bridge", "to-qq.jsonl");
 
 async function flushBridgeOut(): Promise<void> {
@@ -986,7 +986,7 @@ async function flushBridgeOut(): Promise<void> {
         );
       }
       if (kind !== "private") writeChatLine(id, config.bot.selfId, config.bot.nickname, body);
-      log(`[bridge] 咕嘎一号 -> ${kind} ${id}：${body.slice(0, 40)}`);
+      log(`[bridge] 本机个人助手 -> ${kind} ${id}：${body.slice(0, 40)}`);
     } catch (err) {
       log("[bridge] 发送失败:", err instanceof Error ? err.message : err);
     }
