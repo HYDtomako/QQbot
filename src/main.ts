@@ -11,6 +11,7 @@ import { buildReply, splitForCard, splitText, textSegment } from "./reply.ts";
 import { Antispam } from "./antispam.ts";
 import { TaskScheduler } from "./tasks.ts";
 import { ensureSchedule, answerDay, setClassFilter, readCache, type ScheduleBundle } from "../schedule/zf.ts";
+import { prefetchLinks } from "./linktext.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
@@ -695,9 +696,11 @@ async function buildPrompt(
   }
   if (rejectedFiles.length) notes.push(`${rejectedFiles.join("；")} —— 这些文件你读不了，请如实说明`);
   const imgNote = notes.length ? `（附件说明：${notes.join("；")}）` : "";
+  // 链接正文预取：SPA 站点的正文 pi 的 web_read 抓不到，先在消息里取回并附上
+  const linkBlock = trigger.text ? await prefetchLinks(trigger.text) : "";
   if (trigger.kind === "private") {
     const body = trigger.text || "（对方只发来图片，没有文字）";
-    return `[私聊] 来自 ${who}${imgNote}：\n${body}`;
+    return `[私聊] 来自 ${who}${imgNote}：\n${body}${linkBlock}`;
   }
   let name = groupNames.get(trigger.groupId!);
   if (!name) {
@@ -707,7 +710,7 @@ async function buildPrompt(
   const said = trigger.text
     ? ` @你：\n${trigger.text}${imgNote}`
     : ` @了你${imgNote || "（对方没有说其他内容）"}`;
-  return `[群聊] 群「${name ?? trigger.groupId}」（群号 ${trigger.groupId}）| 发言者：${who}${said}`;
+  return `[群聊] 群「${name ?? trigger.groupId}」（群号 ${trigger.groupId}）| 发言者：${who}${said}${linkBlock}`;
 }
 
 async function sendSegments(trigger: TriggeredMessage, segs: MessageSegment[]): Promise<void> {
@@ -951,6 +954,45 @@ async function flushOutbox(): Promise<void> {
   }
 }
 
+// ── 与咕嘎一号的通信桥：读 memory/bridge/to-qq.jsonl，真发到 QQ（与发件箱同一机制）──
+const bridgeOutPath = path.join(root, "memory", "bridge", "to-qq.jsonl");
+
+async function flushBridgeOut(): Promise<void> {
+  if (!existsSync(bridgeOutPath)) return;
+  let lines: string[] = [];
+  try {
+    lines = readFileSync(bridgeOutPath, "utf8").split("\n").filter((x) => x.trim());
+  } catch {
+    return;
+  }
+  if (lines.length === 0) return;
+  try {
+    writeFileSync(bridgeOutPath, "");
+  } catch {
+    return;
+  }
+  for (const line of lines) {
+    try {
+      const item = JSON.parse(line) as { type?: string; id?: string; target?: { type?: string; id?: string }; text?: string };
+      const kind = String(item.type ?? item.target?.type ?? "group");
+      const id = String(item.id ?? item.target?.id ?? config.bot.defaultGroup ?? "");
+      const body = redactSensitive(String(item.text ?? ""));
+      if (!id || !body) continue;
+      for (const chunk of splitText(body)) {
+        await client.sendMessage(
+          kind === "private"
+            ? { message_type: "private", user_id: id, message: [textSegment(chunk)] }
+            : { message_type: "group", group_id: id, message: [textSegment(chunk)] },
+        );
+      }
+      if (kind !== "private") writeChatLine(id, config.bot.selfId, config.bot.nickname, body);
+      log(`[bridge] 咕嘎一号 -> ${kind} ${id}：${body.slice(0, 40)}`);
+    } catch (err) {
+      log("[bridge] 发送失败:", err instanceof Error ? err.message : err);
+    }
+  }
+}
+
 log("[main] pi-napcatqq bot 启动，白名单:", [...whitelist].join(", "));
 if (config.jw?.className) setClassFilter(config.jw.className);
 setInterval(() => refreshAllRosters().catch(() => {}), 10 * 60_000).unref();
@@ -958,6 +1000,7 @@ setInterval(cleanupMemoryArchives, 30 * 60_000).unref();
 setInterval(cleanupChatLogs, 6 * 3600_000).unref();
 setInterval(() => attachments.cleanup(), 15 * 60_000).unref();
 setInterval(() => flushOutbox().catch(() => {}), 3000).unref();
+setInterval(() => flushBridgeOut().catch(() => {}), 3000).unref();
 cleanupChatLogs();
 attachments.cleanup();
 // 内存监控：每小时记录一次桥接进程的常驻内存，便于发现异常增长
