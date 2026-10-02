@@ -42,10 +42,10 @@ QQ 群/私聊 ──► NapCatQQ（OneBot 11 正向 WebSocket :3001）
 
 - **平台**：Windows。启动脚本是 `.bat`/`.vbs`，其他系统需自行改写。
 - **先准备好这些**（都要自己装/下，不在仓库里）：
-  - Node ≥ 22.19
+  - Node ≥ 22.19：https://nodejs.org/ （或 `winget install OpenJS.NodeJS.LTS`）
   - pi：`npm i -g @earendil-works/pi-coding-agent`
-  - NapCatQQ（Shell 版，从官方仓库下载解压）
-  - pdftotext：Git for Windows 自带（读 PDF 用，可选）
+  - NapCatQQ：https://github.com/NapNeko/NapCatQQ ，到 Releases 页下 `NapCat.Shell.Windows.Node.zip`（下打包好的 Shell 版，不是 clone 源码），解压即用
+  - pdftotext（读 PDF 用，可选）：随 Git for Windows 安装，https://git-scm.com/download/win （或 `winget install Git.Git`）
 - **把仓库里的 example 复制成正式文件，改成你自己的值**：
   - `config.example.json` → `config.json`（QQ 号、OneBot token、各模型 API key、教务账号等）
   - `start-napcat.example.bat` → `start-napcat.bat`（填 `NAPCAT_DIR` 和机器人 QQ 号）
@@ -99,7 +99,7 @@ QQ 群/私聊 ──► NapCatQQ（OneBot 11 正向 WebSocket :3001）
 - **Node ≥ 22.19**（用到原生 TS 运行与 `--experimental` 特性）。
 - **pi**：`npm i -g @earendil-works/pi-coding-agent`。Windows 上若 Git 不在默认路径，需在 `~/.pi/agent/settings.json` 里设 `shellPath` 指向 `bash.exe`。
 - **pdftotext**（读 PDF 用）：Git for Windows 自带（`<Git安装目录>/mingw64/bin/pdftotext.exe`），桥接会从 PATH 与 Git 安装目录自动查找；找不到时 PDF 会如实回复读不了，可在 `config.json` 的 `files.pdftotext` 指定完整路径。Word/Excel/PPT 不需要外部工具。
-- **NapCatQQ**：Shell 版解压即用；若启动报 `wrapper.node` 加载失败，从 QQ 安装包的 `Files/versions/*/resources/app/` 提取 `crypto.dll`、`ssl.dll`、`dbghelp.dll` 放入 NapCat 目录。
+- **NapCatQQ**（https://github.com/NapNeko/NapCatQQ）：到 Releases 页下 `NapCat.Shell.Windows.Node.zip`，解压即用；若启动报 `wrapper.node` 加载失败，从 QQ 安装包的 `Files/versions/*/resources/app/` 提取 `crypto.dll`、`ssl.dll`、`dbghelp.dll` 放入 NapCat 目录。
 - **课表的加密脚本**：`schedule/vendor/` 下的 jsbn/rsa 等文件来自教务系统页面（不随仓库分发）。首次使用课表功能前，从教务系统登录页引用的路径下载：
   `http://<教务系统域名>/zftal-ui-v5-1.0.2/assets/plugins/crypto/rsa/{jsbn,prng4,rng,rsa,base64}.js`
 
