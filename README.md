@@ -23,12 +23,36 @@ QQ 群/私聊 ──► NapCatQQ（OneBot 11 正向 WebSocket :3001）
   - 上下文闸门：单文件文本上限 30000 字、单条消息 60000 字、单条消息最多 5 个文件（超出截断或拒绝，参数在 `config.json` 的 `files`）。
 - **权限（说话层）**：只认 QQ 号（`config.bot.owner`，配置里指定），与任何群身份无关；主人的指令绝对优先，其他人仅可提问。
 - **触发规则**：私聊仅白名单（`bot.whitelist`）触发；群聊任何人 @ 机器人即可（真 at 或文本 @ 均可，光 @ 不说话也会回应）。
-- **人设**：`sandbox/.pi/SYSTEM.md`（企鹅主任），改动后下一条消息自动生效。
+- **人设**：`sandbox/.pi/SYSTEM.md`（企鹅主任），改动后下一条消息自动生效。首次使用从 `sandbox/.pi/SYSTEM.example.md` 复制并改成你自己的。
 - **群管-反刷屏**（`src/antispam.ts`，机械判定不经 LLM）：同群相同文本 90 秒内出现 ≥3 次（含单人连发与多人跟风）→ 自动撤回除最先一条外的全部消息，并输出"本群禁止刷屏行为"。院长消息参与计数但豁免撤回。注意 QQ 平台限制：管理员无法撤回其他管理员/群主的消息（撤回失败会记日志）；要完全覆盖需 bot 为群主。参数在 `config.json` 的 `antispam`。
 - **课表查询**（所有人可用，`schedule/zf.ts`）：发"课表/今天课表/明天课表/后天课表/本周课表"，直答"节次+课程+教室+老师+开始时间"。只读查询，无法经此改动任何东西；登录凭据在脱敏清单中，任何回复都不会出现。自动登录教务系统（RSA 加密，无需验证码），按周次拉取（服务端解析单双周），缓存 6 小时。配置在 `config.json` 的 `jw`。
 - **长期记忆**（`memory/long-term/<QQ>.jsonl`，仅院长可写）：院长说"记住X"→ pi 调 `remember` 工具永久保存；每次对话自动把本人条目附在消息前；`recall` 查、`forget` 删（删前复述确认）。每人独立档案，只注入本人的对话；记忆内容不能改变权限规则。
 - **记忆**：每用户独立 5 分钟滚动窗口（`config.memory`）——窗口内续接同一 pi 会话（完整上下文）；过期后旧窗口惰性压缩成 ≤300 字摘要带入新窗口（只在实际有人回来时才花这次调用，窗口过小 <1KB 不压缩），归档 24h 后清理。同用户消息串行处理。
 - 超长回复自动分片；群聊回复以「聊天记录」卡片发送（send_forward_msg，单条）；单次处理超时 240 秒自动终止。
+
+## 与咕嘎一号的通信桥
+
+主人本机还可以挂一个更全能的 AI 助手「咕嘎一号」（能操作本地文件与命令，可换成你自己的）。两者通过文件信箱（`memory/bridge/`）异步通信，只有院长能触发：
+
+- **bot → 咕嘎一号**：`tell_guga` 工具（院长私聊/群里让 bot 给咕嘎一号带话时调用）会直接把留言 POST 给咕嘎一号本地服务的 `/api/send`（默认 `127.0.0.1:8787`），当场踢起一轮、接近即时执行；服务没起或超时才回退写入 `memory/bridge/to-guga.jsonl`，等咕嘎一号下一轮读入。提交时会把「回发目标」（来源是哪个群/私聊，`group:<群号>` 或 `private:<QQ号>`）随留言一起带上。
+- **咕嘎一号 → bot → QQ**：咕嘎一号写 `memory/bridge/to-qq.jsonl`，桥接每 3 秒轮询，通过 OneBot 真发到群或私聊。**回执**：咕嘎一号处理完带话任务后，按留言里的回发目标把结果发回来源会话（仅在院长明确同意的前提下）。
+- 两个文件名固定，两边扩展/桥接按同一路径约定协作；咕嘎一号在线时是即时触发，离线时退化为异步留言。
+
+## 第一次使用
+
+- **平台**：Windows。启动脚本是 `.bat`/`.vbs`，其他系统需自行改写。
+- **先准备好这些**（都要自己装/下，不在仓库里）：
+  - Node ≥ 22.19
+  - pi：`npm i -g @earendil-works/pi-coding-agent`
+  - NapCatQQ（Shell 版，从官方仓库下载解压）
+  - pdftotext：Git for Windows 自带（读 PDF 用，可选）
+- **把仓库里的 example 复制成正式文件，改成你自己的值**：
+  - `config.example.json` → `config.json`（QQ 号、OneBot token、各模型 API key、教务账号等）
+  - `start-napcat.example.bat` → `start-napcat.bat`（填 `NAPCAT_DIR` 和机器人 QQ 号）
+  - `sandbox/.pi/SYSTEM.example.md` → `sandbox/.pi/SYSTEM.md`（机器人人设，按需改）
+  - `pi-bot-start-bridge.example.vbs` → `pi-bot-start-bridge.vbs`（路径已自动推导，一般直接复制即可）
+- 这些正式文件都已被 `.gitignore` 忽略，不会误提交。
+- **想自己加功能**：每个功能一个扩展文件，放在 `sandbox/.pi/extensions/`，照现有文件改即可；桥接侧的钩子在 `src/main.ts`。
 
 ## 启动（日常使用）
 
@@ -53,7 +77,7 @@ QQ 群/私聊 ──► NapCatQQ（OneBot 11 正向 WebSocket :3001）
 
 ### 人设提示词
 
-机器人的身份设定在 `sandbox/.pi/SYSTEM.md`，改动后下一条消息自动生效。
+机器人的身份设定在 `sandbox/.pi/SYSTEM.md`，改动后下一条消息自动生效。仓库里放的是脱敏模板 `sandbox/.pi/SYSTEM.example.md`，首次使用时复制成 `SYSTEM.md` 再按需修改（`SYSTEM.md` 已被 `.gitignore` 忽略，不会进仓库）。
 
 ## 配置
 
