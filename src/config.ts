@@ -56,6 +56,11 @@ export interface BotConfig {
     target: { type: "group" | "private"; id: string };
     prompt: string;
   }>;
+  /** 娱乐模式（主动插话）：只对 modes.json 里开了娱乐模式的群生效 */
+  entertainment?: {
+    /** 目标回复频率 0~1，越小越少主动开口，默认 0.3 */
+    replyFrequency?: number;
+  };
   jw?: {
     user: string;
     password: string;

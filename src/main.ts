@@ -12,6 +12,8 @@ import { Antispam } from "./antispam.ts";
 import { TaskScheduler } from "./tasks.ts";
 import { ensureSchedule, answerDay, setClassFilter, readCache, type ScheduleBundle } from "../schedule/zf.ts";
 import { prefetchLinks } from "./linktext.ts";
+import { Modes, matchModeCommand, extractGroupId } from "./modes.ts";
+import { DynamicReplyGate, estimateReplyProbability } from "./gate.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
@@ -19,6 +21,158 @@ const root = path.resolve(here, "..");
 const config = loadConfig(path.join(root, "config.json"));
 const whitelist = new Set(config.bot.whitelist);
 const sandboxDir = path.join(root, "sandbox");
+const modes = new Modes(path.join(root, "modes.json"));
+
+// ── 娱乐模式状态跟踪：机器人上次在每群说话的时间 ──
+const groupLastBotAt = new Map<string, number>(); // 每群：机器人上次说话的时间
+
+// ── 娱乐模式·主动插话：拿麦麦（MaiBot）的逻辑回归门控试跑（只对开了娱乐模式的群）──
+const ENT_RECENT_WINDOW_MS = 300_000;
+const ENT_REPLY_FREQUENCY = Math.min(1, Math.max(0, config.entertainment?.replyFrequency ?? 0.3));
+
+interface EntState {
+  gate: DynamicReplyGate;
+  recent: Array<{ ts: number; isBot: boolean }>;
+  pending: number;
+  busy: boolean;
+}
+const entStates = new Map<string, EntState>();
+function entState(gid: string): EntState {
+  let s = entStates.get(gid);
+  if (!s) {
+    s = { gate: new DynamicReplyGate(), recent: [], pending: 0, busy: false };
+    entStates.set(gid, s);
+  }
+  return s;
+}
+
+/** 从 OneBot 消息段求出 (hasQuestion, placeholderOnly, atOther)。 */
+function entTextSignals(event: Record<string, unknown>): { hasQuestion: boolean; placeholderOnly: boolean; atOther: boolean } {
+  const segs = Array.isArray(event.message) ? (event.message as Array<{ type: string; data?: Record<string, unknown> }>) : [];
+  let text = "";
+  let onlyMedia = true;
+  let atOther = false;
+  for (const s of segs) {
+    if (s.type === "text") {
+      const t = String(s.data?.text ?? "").trim();
+      text += t;
+      if (t) onlyMedia = false;
+    } else if (s.type === "at") {
+      const qq = String(s.data?.qq ?? "");
+      if (qq && qq !== config.bot.selfId) atOther = true;
+    } else if (["image", "face", "record", "video", "file", "forward"].includes(s.type)) {
+      // 媒体类不计入“有文字”
+    } else {
+      onlyMedia = false;
+    }
+  }
+  return { hasQuestion: /[?？]/.test(text), placeholderOnly: onlyMedia && segs.length > 0, atOther };
+}
+
+/** 群消息进入娱乐模式门控；addressed=这条是否冲着 bot（@了或叫了名字）。 */
+function entertainmentOnGroupMessage(event: Record<string, unknown>, addressed: boolean): void {
+  const gid = String(event.group_id ?? "");
+  if (!gid || !modes.isEntertainment(gid)) return;
+  const now = Date.now();
+  const st = entState(gid);
+  const cutoff = now - ENT_RECENT_WINDOW_MS;
+  while (st.recent.length && st.recent[0].ts < cutoff) st.recent.shift();
+
+  if (addressed) {
+    // @ 或叫名字：强制触发（走普通问答），预计回复数按实测均值计入
+    st.gate.recordForcedTurn(now);
+    st.pending = 0;
+    st.recent.push({ ts: now, isBot: false });
+    return;
+  }
+
+  const { hasQuestion, placeholderOnly, atOther } = entTextSignals(event);
+  st.pending += 1;
+  st.recent.push({ ts: now, isBot: false });
+
+  const recentSelf = st.recent.filter((r) => r.isBot).length;
+  const recentCount = st.recent.length;
+  const lastBot = groupLastBotAt.get(gid);
+  const prob = estimateReplyProbability({
+    mentionBot: false,
+    atOther,
+    hasQuestionMark: hasQuestion,
+    placeholderOnly,
+    recentSelfRatio: recentSelf / Math.max(1, recentCount),
+    recentMessageCount: recentCount,
+    secondsSinceBotMessage: lastBot ? (now - lastBot) / 1000 : 3600,
+    pendingCount: st.pending,
+  });
+  st.gate.recordProactiveDemand(prob, now);
+  const decision = st.gate.evaluate(prob, ENT_REPLY_FREQUENCY, now);
+  if (decision.shouldTrigger && !st.busy) {
+    st.gate.closeRound();
+    st.pending = 0;
+    proactiveSay(gid).catch((err) => log("[ent] 主动插话异常:", err));
+  }
+}
+
+/** 生成并发送一句主动插话。 */
+async function proactiveSay(gid: string): Promise<void> {
+  const st = entState(gid);
+  if (st.busy) return;
+  st.busy = true;
+  try {
+    let name = groupNames.get(gid);
+    if (!name) name = (await client.getGroupName(gid)) ?? undefined;
+    if (name) groupNames.set(gid, name);
+    const ctx = recentChatContext(gid, 20);
+    const prompt =
+      `[娱乐模式·主动插话] 你是 QQ 群「${name ?? gid}」里的成员「${config.bot.nickname}」，以真实群友的口吻参与闲聊。\n` +
+      `下面是群里最近的消息（标注“(你自己)”的是你说过的话）。请自然地插一句话接上话题：\n` +
+      `- 一到两句、口语化、简短；\n` +
+      `- 不要 @ 任何人，不要客套、不要自我介绍、不要任何格式标记；\n` +
+      `- 如果确实没什么可接的，就只回复四个字：这次不说了。\n\n最近消息：\n${ctx}`;
+    const result = await runner.run(prompt, { mode: "web", model: modelRegistry[currentModel] });
+    if (!result.ok) return;
+    const text = redactSensitive(stripMarkdown(result.text || "")).trim();
+    if (!text || /^这次不说了[。.!！]?$/.test(text)) {
+      log(`[ent] 放弃插话 -> 群 ${gid}`);
+      return;
+    }
+    await client.sendMessage({ message_type: "group", group_id: gid, message: [textSegment(text)] });
+    const ts = Date.now();
+    st.recent.push({ ts, isBot: true });
+    st.gate.recordReply(ts);
+    groupLastBotAt.set(gid, ts);
+    writeChatLine(gid, config.bot.selfId, config.bot.nickname, text);
+    log(`[ent] 主动插话 -> 群 ${gid}: ${text.slice(0, 80)}`);
+  } catch (err) {
+    log("[ent] 主动插话失败:", err instanceof Error ? err.message : err);
+  } finally {
+    st.busy = false;
+  }
+}
+
+/** 读取今天该群最近的聊天记录，拼成给模型的上下文。 */
+function recentChatContext(gid: string, limit: number): string {
+  try {
+    const now = new Date();
+    const ymd = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    const p = path.join(chatLogDir, `${gid}-${ymd}.jsonl`);
+    if (!existsSync(p)) return "(暂无记录)";
+    const lines = readFileSync(p, "utf8").trim().split("\n").filter(Boolean).slice(-limit);
+    const out = lines
+      .map((l) => {
+        try {
+          const o = JSON.parse(l) as { u?: string; n?: string; m?: string };
+          const who = o.u === config.bot.selfId ? "(你自己)" : o.n || o.u || "?";
+          return `${who}: ${o.m ?? ""}`;
+        } catch {
+          return "";
+        }
+      })
+      .filter(Boolean);
+    return out.length ? out.join("\n") : "(暂无记录)";
+  } catch {
+    return "(读取失败)";
+  }
+}
 
 const client = new OneBotClient(config.onebot.wsUrl, config.onebot.token);
 const piEnv = {
@@ -114,6 +268,22 @@ async function handleModelCommand(
     trigger,
     `当前模型：${currentModel}（${modelRegistry[currentModel]}）\n可用模型：${aliases.join("、")}`,
   );
+}
+
+/** 娱乐模式开关（仅院长）：群聊作用于本群，私聊可带群号、缺省用默认群。 */
+async function handleModeCommand(trigger: TriggeredMessage, action: "on" | "off"): Promise<void> {
+  const groupId =
+    trigger.kind === "group"
+      ? trigger.groupId ?? null
+      : extractGroupId(trigger.text) ?? config.bot.defaultGroup ?? null;
+  if (!groupId) {
+    await replyText(trigger, "没指定群，也没有默认群，操作没成功。");
+    return;
+  }
+  const on = action === "on";
+  modes.setEntertainment(groupId, on);
+  await replyText(trigger, `娱乐模式已${on ? "开启" : "关闭"}：群 ${groupId}。`);
+  log(`[modes] ${trigger.userId} -> 娱乐模式${on ? "开启" : "关闭"} 群 ${groupId}`);
 }
 
 async function replyText(trigger: TriggeredMessage, text: string): Promise<void> {
@@ -401,20 +571,22 @@ client.onEvent((event) => {
     );
   }
   const trigger = matchMessage(event, config.bot.selfId, whitelist, config.bot.atAliases);
+  if (event.message_type === "group") entertainmentOnGroupMessage(event, trigger !== null);
   if (!trigger) return;
   handleTrigger(trigger).catch((err) => log("[main] 处理失败:", err));
 });
 
-// ── 每用户记忆窗口：5 分钟内续接同一会话；过期后惰性压缩成摘要带入新窗口（控成本）──
+// ── 会话记忆窗口：5 分钟内续接同一会话；过期后惰性压缩成摘要带入新窗口（控成本）──
+// 私聊按用户、群聊按群：群里所有成员的提问/回复写进同一个会话文件，大家共享上下文
 const memoryDir = path.join(root, "memory");
 const memoryArchiveDir = path.join(memoryDir, "archive");
 mkdirSync(memoryArchiveDir, { recursive: true });
 const MEMORY_WINDOW_MS = config.memory?.windowMs ?? 300_000;
 const SUMMARIZE_MIN_BYTES = config.memory?.summarizeMinBytes ?? 1024;
 const SUMMARIZE_PROMPT =
-  "请把这段对话压缩成一段摘要（300 字以内，纯文本）：包括用户是谁、聊过的话题、关键事实与结论、未解决的问题。只输出摘要本身，不要评论。";
-const userWindows = new Map<string, { file: string; last: number }>();
-const pendingByUser = new Map<string, Promise<PiResult>>();
+  "请把这段对话压缩成一段摘要（300 字以内，纯文本）：包括对话参与者是谁、聊过的话题、关键事实与结论、未解决的问题。只输出摘要本身，不要评论。";
+const sessionWindows = new Map<string, { file: string; last: number }>();
+const pendingByKey = new Map<string, Promise<PiResult>>();
 
 function killTree(pid: number | undefined): void {
   if (!pid) return;
@@ -466,16 +638,17 @@ async function summarizeSession(file: string): Promise<string> {
 }
 
 /**
- * 取得该用户当前的会话文件：窗口活跃则续接；过期则归档旧窗口并惰性生成摘要。
+ * 取得指定上下文的会话文件：窗口活跃则续接；过期则归档旧窗口并惰性生成摘要。
+ * 键：私聊 `user-<QQ号>`，群聊 `group-<群号>`（整群共享一个上下文）。
  */
-async function memorySessionFor(userId: string): Promise<{ file: string; summary: string }> {
+async function memorySessionFor(ctxKey: string): Promise<{ file: string; summary: string }> {
   const now = Date.now();
-  const file = path.join(memoryDir, `user-${userId}.jsonl`);
-  const win = userWindows.get(userId);
+  const file = path.join(memoryDir, `${ctxKey}.jsonl`);
+  const win = sessionWindows.get(ctxKey);
   // 桥接重启后内存窗口丢失：以会话文件修改时间兜底，避免误判过期、白白压缩
   const lastActive = win?.last ?? (existsSync(file) ? statSync(file).mtimeMs : 0);
   if (now - lastActive < MEMORY_WINDOW_MS) {
-    userWindows.set(userId, { file, last: now });
+    sessionWindows.set(ctxKey, { file, last: now });
     return { file, summary: "" };
   }
 
@@ -483,16 +656,16 @@ async function memorySessionFor(userId: string): Promise<{ file: string; summary
   let summary = "";
   if (existsSync(file) && statSync(file).size >= SUMMARIZE_MIN_BYTES) {
     const stamp = new Date(now).toISOString().replace(/[:.]/g, "-");
-    const archive = path.join(memoryArchiveDir, `user-${userId}-${stamp}.jsonl`);
+    const archive = path.join(memoryArchiveDir, `${ctxKey}-${stamp}.jsonl`);
     try {
       renameSync(file, archive);
       summary = await summarizeSession(archive);
-      if (summary) log(`[memory] 用户 ${userId} 旧窗口已压缩（${Math.round(statSync(archive).size / 1024)}KB）`);
+      if (summary) log(`[memory] ${ctxKey} 旧窗口已压缩（${Math.round(statSync(archive).size / 1024)}KB）`);
     } catch (err) {
       log("[memory] 归档/压缩失败:", err instanceof Error ? err.message : err);
     }
   }
-  userWindows.set(userId, { file, last: now });
+  sessionWindows.set(ctxKey, { file, last: now });
   return { file, summary };
 }
 
@@ -538,6 +711,17 @@ async function handleTrigger(trigger: TriggeredMessage): Promise<void> {
     return;
   }
 
+  // 娱乐模式开关：仅院长；命中则不经过 pi
+  const modeCmd = matchModeCommand(trigger.text);
+  if (modeCmd) {
+    if (trigger.userId !== config.bot.owner) {
+      await replyText(trigger, "只有院长可以开启或关闭娱乐模式。");
+      return;
+    }
+    await handleModeCommand(trigger, modeCmd.action);
+    return;
+  }
+
   // 课表指令：对所有人开放（只读查询；背后登录信息受脱敏保护，任何人都无法经此改动任何东西）
   const sched = matchScheduleCommand(trigger.text);
   if (sched) {
@@ -545,23 +729,26 @@ async function handleTrigger(trigger: TriggeredMessage): Promise<void> {
     return;
   }
 
-  // 同用户串行：避免并发写同一会话文件；窗口续接/过期压缩在此链路内完成
+  // 同一上下文串行：群聊按群共享会话文件（避免并发写同一文件），私聊按用户
   const runStart = Date.now();
-  const prev = pendingByUser.get(trigger.userId) ?? Promise.resolve();
+  const ctxKey = trigger.kind === "group" ? `group-${trigger.groupId}` : `user-${trigger.userId}`;
+  const prev = pendingByKey.get(ctxKey) ?? Promise.resolve();
   const task = prev.catch(() => undefined).then(async () => {
-    const { file, summary } = await memorySessionFor(trigger.userId);
+    const { file, summary } = await memorySessionFor(ctxKey);
     const { images, files } = await attachments.collect(trigger);
     const { files: readyFiles, rejected } = files.length
       ? await attachments.materializeFiles(files)
       : { files: [], rejected: [] };
-    // 长期记忆：只注入本人条目，按相关性挑选（核心 + 相关 + 最近），总量封顶
+    // 长期记忆：只注入发言人本人条目，按相关性挑选（核心 + 相关 + 最近），总量封顶
     const sel = selectMemories(trigger.userId, trigger.text);
     const memoBlock = sel.lines.length
-      ? `[关于该用户的长期记忆（共 ${sel.total} 条，以下 ${sel.lines.length} 条与本次相关；需要更多可用 recall 工具查询）]\n${sel.lines.join("\n")}\n\n`
+      ? `[关于${trigger.kind === "group" ? "该发言者" : "该用户"}的长期记忆（共 ${sel.total} 条，以下 ${sel.lines.length} 条与本次相关；需要更多可用 recall 工具查询）]\n${sel.lines.join("\n")}\n\n`
       : "";
     const prompt =
       memoBlock +
-      (summary ? `[此前与该用户的对话摘要（更早内容已压缩）]\n${summary}\n\n` : "") +
+      (summary
+        ? `[此前${trigger.kind === "group" ? "本群的" : "与该用户的"}对话摘要（更早内容已压缩）]\n${summary}\n\n`
+        : "") +
       (await buildPrompt(trigger, images.length, readyFiles, rejected));
     // 超量时后台自动合并（不阻塞本次回复）
     maybeMergeMemories(trigger.userId).catch(() => {});
@@ -573,9 +760,9 @@ async function handleTrigger(trigger: TriggeredMessage): Promise<void> {
       imagePaths: [...imagePaths, ...readyFiles.map((f) => f.path)],
     });
   });
-  pendingByUser.set(trigger.userId, task);
+  pendingByKey.set(ctxKey, task);
   const result = await task;
-  if (pendingByUser.get(trigger.userId) === task) pendingByUser.delete(trigger.userId);
+  if (pendingByKey.get(ctxKey) === task) pendingByKey.delete(ctxKey);
 
   const raw = result.text || "(空回复)";
   const text = redactSensitive(stripMarkdown(raw));
@@ -611,6 +798,14 @@ async function handleTrigger(trigger: TriggeredMessage): Promise<void> {
     /* 无图片则按文本发送 */
   }
 
+  // 娱乐模式群：像普通群友一样直接发文本，不打"聊天记录"卡片、不 @ 提问者
+  if (trigger.kind === "group" && modes.isEntertainment(trigger.groupId!)) {
+    for (const chunk of splitText(text)) {
+      await sendSegments(trigger, [textSegment(chunk)]).catch((err) => log("[send] 失败:", err.message));
+    }
+    return;
+  }
+
   // 群聊：回复打包成一条"聊天记录"卡片（send_forward_msg，单次调用单条消息）
   if (trigger.kind === "group") {
     // 卡片内同样分成多条短消息，避免一条里塞一大段
@@ -622,6 +817,8 @@ async function handleTrigger(trigger: TriggeredMessage): Promise<void> {
     }));
     const forwardId = await client.sendForward({ kind: "group", groupId: trigger.groupId! }, nodes);
     if (forwardId) {
+      // 卡片回复也进群聊日志，后续注入给 bot 的“最近聊天记录”里能看到自己说过的话
+      writeChatLine(trigger.groupId!, config.bot.selfId, config.bot.nickname, text);
       log(`[send] 卡片已发送 -> 群 ${trigger.groupId}（回复 @${trigger.senderName ?? trigger.userId}）`);
       return;
     }
@@ -710,7 +907,25 @@ async function buildPrompt(
   const said = trigger.text
     ? ` @你：\n${trigger.text}${imgNote}`
     : ` @了你${imgNote || "（对方没有说其他内容）"}`;
-  return `[群聊] 群「${name ?? trigger.groupId}」（群号 ${trigger.groupId}）| 发言者：${who}${said}${linkBlock}`;
+  // 娱乐模式：走“群友口吻”那套提示词，与主动插话保持一致
+  if (modes.isEntertainment(trigger.groupId!)) {
+    const entSaid = trigger.text ? `\n${trigger.text}${imgNote}` : `（@了你）${imgNote}`;
+    return (
+      `[娱乐模式·群聊] 你是 QQ 群「${name ?? trigger.groupId}」里的成员「${config.bot.nickname}」，` +
+      `像真实群友一样说话：口语、简短、自然，别像助手或客服，别客套、别用书面语。\n` +
+      `发言者：${who}${entSaid}${linkBlock}`
+    );
+  }
+  // 正常模式：附上群里最近的聊天记录，让 bot 看到大家正在聊什么（“(你自己)”标记的是 bot 之前说过的话）
+  const chatCtx = recentChatContext(trigger.groupId!, 20);
+  const chatBlock =
+    chatCtx && chatCtx !== "(暂无记录)" && chatCtx !== "(读取失败)"
+      ? `[群里最近的聊天记录（“(你自己)”标记的是你说过的话）]\n${chatCtx}\n\n`
+      : "";
+  return (
+    `[群聊] 群「${name ?? trigger.groupId}」（群号 ${trigger.groupId}）\n` +
+    `${chatBlock}发言者：${who}${said}${linkBlock}`
+  );
 }
 
 async function sendSegments(trigger: TriggeredMessage, segs: MessageSegment[]): Promise<void> {
@@ -727,6 +942,11 @@ async function sendSegments(trigger: TriggeredMessage, segs: MessageSegment[]): 
       })
       .join("");
     if (content.trim()) writeChatLine(trigger.groupId, config.bot.selfId, config.bot.nickname, content);
+    // 影子门控：记下机器人自己刚说过话（时间 + 发言者）
+    groupLastBotAt.set(trigger.groupId, Date.now());
+    // 娱乐模式：把这次发言计进近期窗口，供主动门控参考
+    const est = entStates.get(trigger.groupId);
+    if (est) est.recent.push({ ts: Date.now(), isBot: true });
   }
 }
 
