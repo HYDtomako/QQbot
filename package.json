@@ -6,7 +6,11 @@
   "description": "QQ bot bridge: NapCatQQ (OneBot 11) -> pi coding agent",
   "scripts": {
     "bot": "node src/main.ts",
-    "selftest:docparse": "node scripts/docparse-selftest.ts"
+    "selftest:docparse": "node scripts/docparse-selftest.ts",
+    "selftest:knowledge": "node scripts/knowledge-selftest.ts",
+    "selftest:runner": "node scripts/runner-selftest.ts",
+    "selftest:bridge": "node scripts/bridge-smoke-selftest.ts",
+    "selftest:memory": "node scripts/runner-selftest.ts && node scripts/knowledge-selftest.ts && node scripts/knowledge-safety-selftest.ts && node scripts/legacy-guard-selftest.ts && node scripts/knowledge-integration-selftest.ts && node scripts/bridge-smoke-selftest.ts"
   },
   "dependencies": {
     "@napi-rs/canvas": "^1.0.9",
