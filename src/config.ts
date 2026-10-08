@@ -1,4 +1,6 @@
 import { readFileSync } from "node:fs";
+import { normalizeKnowledgeConfig } from "./knowledge/policy.ts";
+import type { KnowledgeOptions } from "./knowledge/types.ts";
 
 export interface BotConfig {
   onebot: { wsUrl: string; token: string };
@@ -34,6 +36,7 @@ export interface BotConfig {
     windowMs?: number;
     summarizeMinBytes?: number;
   };
+  knowledge?: KnowledgeOptions;
   /** 附件（图片/文件）处理参数 */
   files?: {
     /** 单个文件的文本上限（字符），超出截断，默认 30000 */
@@ -76,5 +79,6 @@ export function loadConfig(path: string): BotConfig {
   const cfg = JSON.parse(readFileSync(path, "utf8")) as BotConfig;
   if (!cfg.onebot?.wsUrl) throw new Error(`config ${path}: onebot.wsUrl 缺失`);
   if (!Array.isArray(cfg.bot?.whitelist)) throw new Error(`config ${path}: bot.whitelist 缺失`);
+  if (cfg.knowledge !== undefined) cfg.knowledge = normalizeKnowledgeConfig(cfg.knowledge, cfg.bot.whitelist);
   return cfg;
 }

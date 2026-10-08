@@ -1,6 +1,5 @@
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync, existsSync, readFileSync, statSync, renameSync, readdirSync, unlinkSync, watchFile } from "node:fs";
 import { loadConfig } from "./config.ts";
 import { OneBotClient, type MessageSegment } from "./onebot.ts";
@@ -14,7 +13,12 @@ import { ensureSchedule, answerDay, setClassFilter, readCache, type ScheduleBund
 import { prefetchLinks } from "./linktext.ts";
 import { Modes, matchModeCommand, extractGroupId } from "./modes.ts";
 import { DynamicReplyGate, estimateReplyProbability } from "./gate.ts";
+import { KnowledgeService } from "./knowledge/service.ts";
+import type { KnowledgeTurn } from "./knowledge/types.ts";
+import { normalizeKnowledgeConfig } from "./knowledge/policy.ts";
+import { acceptedKnowledgeInput, isKnowledgeCommand, knowledgeContextPrompt } from "./knowledge/bridge.ts";
 
+const log = (...args: unknown[]) => console.log(new Date().toISOString(), ...args);
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
 
@@ -128,7 +132,7 @@ async function proactiveSay(gid: string): Promise<void> {
       `- 一到两句、口语化、简短；\n` +
       `- 不要 @ 任何人，不要客套、不要自我介绍、不要任何格式标记；\n` +
       `- 如果确实没什么可接的，就只回复四个字：这次不说了。\n\n最近消息：\n${ctx}`;
-    const result = await runner.run(prompt, { mode: "web", model: modelRegistry[currentModel] });
+    const result = await runner.run(prompt, { mode: "web", model: modelRegistry[currentModel], env: legacyToolEnv() });
     if (!result.ok) return;
     const text = redactSensitive(stripMarkdown(result.text || "")).trim();
     if (!text || /^这次不说了[。.!！]?$/.test(text)) {
@@ -209,6 +213,37 @@ function loadCurrentModel(): string {
 }
 
 let currentModel = loadCurrentModel();
+
+const knowledgePath = path.join(root, "memory", "knowledge.sqlite");
+const knowledge = config.knowledge !== undefined || existsSync(knowledgePath)
+  ? new KnowledgeService({
+      dbPath: knowledgePath,
+      legacyDir: path.join(root, "memory", "long-term"),
+      config: normalizeKnowledgeConfig(config.knowledge, config.bot.whitelist),
+      ownerId: config.bot.owner,
+      whitelist: config.bot.whitelist,
+      isNormal: (scope) => !scope.startsWith("group:") || !modes.isEntertainment(scope.slice(6)),
+      runModel: (prompt, signal) => runner.run(prompt, {
+        mode: "none", model: modelRegistry[currentModel], priority: "background", timeoutMs: 60000, signal,
+      }),
+      log,
+    })
+  : undefined;
+if (knowledge) await knowledge.start();
+
+function legacyToolEnv(): Record<string, string> {
+  const rows = knowledge?.store.db.prepare("SELECT scope FROM scope_policies WHERE ever_enabled=1").all() as { scope: string }[] | undefined;
+  return {
+    QQ_KNOWLEDGE_PROTECTED_GROUPS: JSON.stringify([...new Set([
+      ...(config.knowledge?.enabled ? config.knowledge.groups ?? [] : []),
+      ...(rows ?? []).filter(r => r.scope.startsWith("group:")).map(r => r.scope.slice(6)),
+    ])]),
+    QQ_KNOWLEDGE_PROTECTED_USERS: JSON.stringify([...new Set([
+      ...(config.knowledge?.enabled ? config.knowledge.privateUsers ?? [] : []),
+      ...(rows ?? []).filter(r => r.scope.startsWith("private:")).map(r => r.scope.slice(8)),
+    ])]),
+  };
+}
 
 function setCurrentModel(alias: string): void {
   currentModel = alias;
@@ -417,8 +452,6 @@ function answerWeek(cache: ScheduleBundle, periodTimes?: Record<string, string>,
   return parts.length ? `第 ${week} 周课表：\n${parts.join("\n")}` : `第 ${week} 周没有查到课程。`;
 }
 
-const log = (...args: unknown[]) => console.log(new Date().toISOString(), ...args);
-
 // ── 输出脱敏：密钥不得出现在发给任何人的消息里（对所有人生效，院长也不例外）──
 
 // 精确密钥值与专属接口域名（与 config/扩展保持一致）
@@ -498,7 +531,7 @@ const taskScheduler = new TaskScheduler(
       runner.run(
         `[定时任务] 以下是院长预先设置并已授权的定时任务，直接执行，不要因为看不到发送者身份信息而拒绝。\n` +
           `注意：你的最终输出会被系统自动发送到目标群/私聊，**直接输出内容即可，不要再调用 send_group_message 等发送类工具**（否则会重复发送）。\n${prompt}`,
-        { mode: "web", model: modelRegistry[currentModel], priority: "scheduled" },
+        { mode: "web", model: modelRegistry[currentModel], priority: "scheduled", env: legacyToolEnv() },
       ),
     sendTo: async (target, text) => {
       for (const chunk of splitText(redactSensitive(text))) {
@@ -558,6 +591,11 @@ client.onEvent((event) => {
     if (event.group_id) refreshRoster(String(event.group_id));
     return;
   }
+  if (event.post_type === "notice" && (event.notice_type === "group_recall" || event.notice_type === "friend_recall")) {
+    const scope = event.notice_type === "group_recall" ? `group:${String(event.group_id ?? "")}` : `private:${String(event.user_id ?? "")}`;
+    knowledge?.retract(scope, String(event.message_id ?? ""));
+    return;
+  }
   if (event.post_type !== "message") return;
   if (event.message_type === "group") {
     logGroupChat(event);
@@ -588,53 +626,15 @@ const SUMMARIZE_PROMPT =
 const sessionWindows = new Map<string, { file: string; last: number }>();
 const pendingByKey = new Map<string, Promise<PiResult>>();
 
-function killTree(pid: number | undefined): void {
-  if (!pid) return;
-  if (process.platform === "win32") {
-    spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true }).on("error", () => {});
-  } else {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      /* 已退出 */
-    }
-  }
-}
 
 /** 旧窗口摘要：用当前模型跑一次无工具的廉价调用。失败返回空（不带摘要继续）。 */
 async function summarizeSession(file: string): Promise<string> {
   const spec = modelRegistry[currentModel];
   if (!spec) return "";
-  const args = [
-    ...config.pi.args,
-    "--no-tools",
-    "--thinking",
-    config.pi.thinking,
-    "--model",
-    spec,
-    "--session",
-    file,
-    SUMMARIZE_PROMPT,
-  ];
-  return new Promise((resolve) => {
-    const child = spawn(config.pi.command, args, {
-      cwd: sandboxDir,
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, ...piEnv },
-    });
-    let out = "";
-    const timer = setTimeout(() => killTree(child.pid), 60_000);
-    child.stdout.on("data", (d: Buffer) => (out += d.toString("utf8")));
-    child.on("error", () => {
-      clearTimeout(timer);
-      resolve("");
-    });
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      resolve(code === 0 ? out.trim().slice(0, 2000) : "");
-    });
+  const result = await runner.run(SUMMARIZE_PROMPT, {
+    mode: "none", model: spec, sessionFile: file, timeoutMs: 60000, priority: "interactive",
   });
+  return result.ok ? result.text.trim().slice(0, 2000) : "";
 }
 
 /**
@@ -729,34 +729,63 @@ async function handleTrigger(trigger: TriggeredMessage): Promise<void> {
     return;
   }
 
+  const normalAtEntry = trigger.kind !== "group" || !modes.isEntertainment(trigger.groupId!);
+  const memoryInput = acceptedKnowledgeInput(trigger, normalAtEntry);
+  const memoryCommand = isKnowledgeCommand(trigger.text)
+    ? !normalAtEntry ? "娱乐模式不使用这套记忆，请在正常模式下管理。"
+      : knowledge ? await knowledge.handleCommand(memoryInput)
+      : "自动记忆尚未配置。请设置 knowledge.enabled 和允许的 groups/privateUsers，再重启后在对应范围开启记忆。"
+    : undefined;
+  if (memoryCommand !== undefined) {
+    await replyText(trigger, memoryCommand);
+    return;
+  }
+
   // 同一上下文串行：群聊按群共享会话文件（避免并发写同一文件），私聊按用户
   const runStart = Date.now();
   const ctxKey = trigger.kind === "group" ? `group-${trigger.groupId}` : `user-${trigger.userId}`;
   const prev = pendingByKey.get(ctxKey) ?? Promise.resolve();
   const task = prev.catch(() => undefined).then(async () => {
-    const { file, summary } = await memorySessionFor(ctxKey);
+    const managed = normalAtEntry && !!knowledge?.isManaged(memoryInput);
+    const session = managed ? { file: undefined, summary: "" } : await memorySessionFor(ctxKey);
     const { images, files } = await attachments.collect(trigger);
     const { files: readyFiles, rejected } = files.length
       ? await attachments.materializeFiles(files)
       : { files: [], rejected: [] };
-    // 长期记忆：只注入发言人本人条目，按相关性挑选（核心 + 相关 + 最近），总量封顶
-    const sel = selectMemories(trigger.userId, trigger.text);
+    const imagePaths = images.length ? await attachments.materializeImages(images) : [];
+    if (managed && knowledge) {
+      let turn: KnowledgeTurn = { env: {}, contextBlock: "" };
+      try { turn = await knowledge.prepareTurn(memoryInput); }
+      catch { log("[knowledge] 采集失败，本轮不使用记忆凭据"); }
+      let result: PiResult = { ok: false, text: "记忆问答未完成", durationMs: 0 };
+      try {
+        const prompt = knowledgeContextPrompt(turn) + await buildPrompt(trigger, images.length, readyFiles, rejected, {
+          includeRecentChat: false, normalMode: true,
+        });
+        result = await runner.run(prompt, {
+          mode: "knowledge", model: modelRegistry[currentModel], env: { ...legacyToolEnv(), ...turn.env },
+          imagePaths: [...imagePaths, ...readyFiles.map((f) => f.path)],
+        });
+        if (!knowledge.isTurnCurrent(turn)) {
+          result = { ok: false, text: "本次记忆权限或资料已撤销，已停止使用旧上下文，请重新提问。", durationMs: result.durationMs };
+        }
+        return result;
+      } finally {
+        await knowledge.finishTurn(turn, { ok: result.ok, text: redactSensitive(stripMarkdown(result.text)) })
+          .catch(() => log("[knowledge] 回复上下文保存失败"));
+      }
+    }
+    const legacyPersonalAllowed = !knowledge?.isManaged({ ...memoryInput, kind: "private", groupId: undefined });
+    const sel = legacyPersonalAllowed ? selectMemories(trigger.userId, trigger.text) : { lines: [], total: 0 };
     const memoBlock = sel.lines.length
       ? `[关于${trigger.kind === "group" ? "该发言者" : "该用户"}的长期记忆（共 ${sel.total} 条，以下 ${sel.lines.length} 条与本次相关；需要更多可用 recall 工具查询）]\n${sel.lines.join("\n")}\n\n`
       : "";
-    const prompt =
-      memoBlock +
-      (summary
-        ? `[此前${trigger.kind === "group" ? "本群的" : "与该用户的"}对话摘要（更早内容已压缩）]\n${summary}\n\n`
-        : "") +
-      (await buildPrompt(trigger, images.length, readyFiles, rejected));
-    // 超量时后台自动合并（不阻塞本次回复）
-    maybeMergeMemories(trigger.userId).catch(() => {});
-    const imagePaths = images.length ? await attachments.materializeImages(images) : [];
+    const prompt = memoBlock + (session.summary
+      ? `[此前${trigger.kind === "group" ? "本群的" : "与该用户的"}对话摘要（更早内容已压缩）]\n${session.summary}\n\n`
+      : "") + await buildPrompt(trigger, images.length, readyFiles, rejected);
+    if (legacyPersonalAllowed) maybeMergeMemories(trigger.userId).catch(() => {});
     return runner.run(prompt, {
-      mode: "web",
-      model: modelRegistry[currentModel],
-      sessionFile: file,
+      mode: "web", model: modelRegistry[currentModel], sessionFile: session.file, env: legacyToolEnv(),
       imagePaths: [...imagePaths, ...readyFiles.map((f) => f.path)],
     });
   });
@@ -879,6 +908,7 @@ async function buildPrompt(
   imageCount = 0,
   fileList: MaterializedFile[] = [],
   rejectedFiles: string[] = [],
+  options: { includeRecentChat?: boolean; normalMode?: boolean } = {},
 ): Promise<string> {
   const roleStr = trigger.senderRole ? `，${ROLE_NAMES[trigger.senderRole] ?? trigger.senderRole}` : "";
   const who =
@@ -908,7 +938,7 @@ async function buildPrompt(
     ? ` @你：\n${trigger.text}${imgNote}`
     : ` @了你${imgNote || "（对方没有说其他内容）"}`;
   // 娱乐模式：走“群友口吻”那套提示词，与主动插话保持一致
-  if (modes.isEntertainment(trigger.groupId!)) {
+  if (options.normalMode !== true && modes.isEntertainment(trigger.groupId!)) {
     const entSaid = trigger.text ? `\n${trigger.text}${imgNote}` : `（@了你）${imgNote}`;
     return (
       `[娱乐模式·群聊] 你是 QQ 群「${name ?? trigger.groupId}」里的成员「${config.bot.nickname}」，` +
@@ -917,7 +947,7 @@ async function buildPrompt(
     );
   }
   // 正常模式：附上群里最近的聊天记录，让 bot 看到大家正在聊什么（“(你自己)”标记的是 bot 之前说过的话）
-  const chatCtx = recentChatContext(trigger.groupId!, 20);
+  const chatCtx = options.includeRecentChat === false ? "" : recentChatContext(trigger.groupId!, 20);
   const chatBlock =
     chatCtx && chatCtx !== "(暂无记录)" && chatCtx !== "(读取失败)"
       ? `[群里最近的聊天记录（“(你自己)”标记的是你说过的话）]\n${chatCtx}\n\n`
@@ -950,10 +980,12 @@ async function sendSegments(trigger: TriggeredMessage, segs: MessageSegment[]): 
   }
 }
 
+let shuttingDown = false;
+
 /** 单一重连循环：连接失败指数退避重试，连接成功后阻塞等待断开再重连。 */
 async function connectLoop(): Promise<void> {
   let delay = 1000;
-  for (;;) {
+  while (!shuttingDown) {
     try {
       await client.connect();
       log("[onebot] 已连接", config.onebot.wsUrl);
@@ -1080,27 +1112,11 @@ function selectMemories(userId: string, query: string): { lines: string[]; total
 }
 
 /** 用一次无工具的 pi 调用执行文本任务（长期记忆合并等）。 */
-function runPiText(prompt: string, timeoutMs = 90_000): Promise<string> {
-  const args = [...config.pi.args, "--no-tools", "--thinking", config.pi.thinking, "--model", modelRegistry[currentModel], "--no-session", prompt];
-  return new Promise((resolve) => {
-    const child = spawn(config.pi.command, args, {
-      cwd: sandboxDir,
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, ...piEnv },
-    });
-    let out = "";
-    const timer = setTimeout(() => killTree(child.pid), timeoutMs);
-    child.stdout.on("data", (d: Buffer) => (out += d.toString("utf8")));
-    child.on("error", () => {
-      clearTimeout(timer);
-      resolve("");
-    });
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      resolve(code === 0 ? out.trim() : "");
-    });
+async function runPiText(prompt: string, timeoutMs = 90_000): Promise<string> {
+  const result = await runner.run(prompt, {
+    mode: "none", model: modelRegistry[currentModel], priority: "background", timeoutMs,
   });
+  return result.ok ? result.text.trim() : "";
 }
 
 const mergingUsers = new Set<string>();
@@ -1230,4 +1246,16 @@ setInterval(() => {
 }, 3600_000).unref();
 refreshScheduleAll().catch(() => {});
 setInterval(() => refreshScheduleAll().catch(() => {}), 6 * 3600_000).unref();
+async function shutdown(): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  taskScheduler.stop();
+  client.close();
+  await runner.close();
+  await knowledge?.close();
+  process.exit(0);
+}
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.once(signal, () => { void shutdown().catch(() => process.exit(1)); });
+}
 await connectLoop();
