@@ -7,13 +7,14 @@ import { OneBotClient, type MessageSegment } from "./onebot.ts";
 import { matchMessage, type TriggeredMessage } from "./router.ts";
 import { createAttachments, type MaterializedFile } from "./attachments.ts";
 import { PiRunner } from "./runner.ts";
-import { buildReply, splitForCard, splitText, textSegment } from "./reply.ts";
+import { buildReply, splitForCard, splitText, textSegment, MAX_SEGMENT_LEN } from "./reply.ts";
 import { Antispam } from "./antispam.ts";
 import { TaskScheduler } from "./tasks.ts";
 import { ensureSchedule, answerDay, setClassFilter, readCache, type ScheduleBundle } from "../schedule/zf.ts";
 import { prefetchLinks } from "./linktext.ts";
 import { Modes, matchModeCommand, extractGroupId } from "./modes.ts";
 import { DynamicReplyGate, estimateReplyProbability } from "./gate.ts";
+import { StickerLibrary, parseEntertainmentReply, stickerPrompt, type StickerEntry } from "./stickers.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
@@ -22,6 +23,7 @@ const config = loadConfig(path.join(root, "config.json"));
 const whitelist = new Set(config.bot.whitelist);
 const sandboxDir = path.join(root, "sandbox");
 const modes = new Modes(path.join(root, "modes.json"));
+const stickerLibrary = new StickerLibrary(path.join(root, "stickers"));
 
 // ── 娱乐模式状态跟踪：机器人上次在每群说话的时间 ──
 const groupLastBotAt = new Map<string, number>(); // 每群：机器人上次说话的时间
@@ -122,30 +124,86 @@ async function proactiveSay(gid: string): Promise<void> {
     if (!name) name = (await client.getGroupName(gid)) ?? undefined;
     if (name) groupNames.set(gid, name);
     const ctx = recentChatContext(gid, 20);
+    const choices = stickerLibrary.available(gid);
     const prompt =
       `[娱乐模式·主动插话] 你是 QQ 群「${name ?? gid}」里的成员「${config.bot.nickname}」，以真实群友的口吻参与闲聊。\n` +
       `下面是群里最近的消息（标注“(你自己)”的是你说过的话）。请自然地插一句话接上话题：\n` +
       `- 一到两句、口语化、简短；\n` +
-      `- 不要 @ 任何人，不要客套、不要自我介绍、不要任何格式标记；\n` +
-      `- 如果确实没什么可接的，就只回复四个字：这次不说了。\n\n最近消息：\n${ctx}`;
+      `- 不要 @ 任何人，不要客套、不要自我介绍；\n` +
+      `- 没有合适的话、你刚说过，或别人正在聊他们自己的事时，可以沉默。\n` +
+      stickerPrompt(choices) +
+      `\n最近消息：\n${ctx}`;
     const result = await runner.run(prompt, { mode: "web", model: modelRegistry[currentModel] });
     if (!result.ok) return;
-    const text = redactSensitive(stripMarkdown(result.text || "")).trim();
-    if (!text || /^这次不说了[。.!！]?$/.test(text)) {
-      log(`[ent] 放弃插话 -> 群 ${gid}`);
-      return;
-    }
-    await client.sendMessage({ message_type: "group", group_id: gid, message: [textSegment(text)] });
-    const ts = Date.now();
-    st.recent.push({ ts, isBot: true });
-    st.gate.recordReply(ts);
-    groupLastBotAt.set(gid, ts);
-    writeChatLine(gid, config.bot.selfId, config.bot.nickname, text);
-    log(`[ent] 主动插话 -> 群 ${gid}: ${text.slice(0, 80)}`);
+    await sendEntertainmentReply(gid, result.text ?? "", choices, "主动插话");
   } catch (err) {
     log("[ent] 主动插话失败:", err instanceof Error ? err.message : err);
   } finally {
     st.busy = false;
+  }
+}
+
+/**
+ * 娱乐模式回复落地：解析回复协议 → 组装文本/表情包消息 → 发送并记账。
+ * 表情包按 ID 校验后发送原文件字节；图片被明确拒绝时回退纯文字；协议解析不了整条放弃。
+ */
+async function sendEntertainmentReply(gid: string, raw: string, choices: StickerEntry[], label: string): Promise<void> {
+  const reply = parseEntertainmentReply(raw);
+  if (!reply.valid) {
+    log(`[ent] 忽略无法解析的回复 -> 群 ${gid}`);
+    return;
+  }
+  const text = redactSensitive(stripMarkdown(reply.text)).trim();
+  let sticker = reply.sticker ? choices.find((c) => c.id === reply.sticker) : undefined;
+  let image: MessageSegment | undefined;
+  if (sticker) {
+    try {
+      image = stickerLibrary.image(sticker);
+    } catch {
+      log(`[ent] 表情包不可用，回退文字 -> 群 ${gid}: ${sticker.id}`);
+      sticker = undefined;
+    }
+  }
+  if (!text && !image) {
+    log(`[ent] 放弃插话 -> 群 ${gid}`);
+    return;
+  }
+  try {
+    if (!image && text.length > MAX_SEGMENT_LEN) {
+      // 纯文字超长时按普通分片发送；带图的消息文字很短，不需要分片
+      for (const chunk of splitText(text)) {
+        await client.sendMessage({ message_type: "group", group_id: gid, message: [textSegment(chunk)] });
+      }
+    } else {
+      let sent = await client.sendMessage({
+        message_type: "group",
+        group_id: gid,
+        message: [...(text ? [textSegment(text)] : []), ...(image ? [image] : [])],
+      });
+      // 超时或断线无法确认送达，只对明确的 API 拒绝回退，避免重复发送
+      if ((sent.status !== "ok" || sent.retcode !== 0) && image && text) {
+        log(`[ent] 图片发送被拒绝，回退文字 -> 群 ${gid}`);
+        sent = await client.sendMessage({ message_type: "group", group_id: gid, message: [textSegment(text)] });
+        sticker = undefined;
+      }
+      if (sent.status !== "ok" || sent.retcode !== 0) {
+        log(`[ent] ${label}发送失败 -> 群 ${gid}: retcode=${sent.retcode}`);
+        return;
+      }
+    }
+    const ts = Date.now();
+    const st = entStates.get(gid);
+    if (st) {
+      st.recent.push({ ts, isBot: true });
+      st.gate.recordReply(ts);
+    }
+    groupLastBotAt.set(gid, ts);
+    stickerLibrary.recordSent(gid, sticker?.id ?? null, ts);
+    const content = [text, sticker ? `[表情包:${sticker.name} (${sticker.id})]` : ""].filter(Boolean).join(" ");
+    writeChatLine(gid, config.bot.selfId, config.bot.nickname, content);
+    log(`[ent] ${label} -> 群 ${gid}: ${content.slice(0, 80)}`);
+  } catch (err) {
+    log(`[ent] ${label}失败:`, err instanceof Error ? err.message : err);
   }
 }
 
@@ -798,11 +856,13 @@ async function handleTrigger(trigger: TriggeredMessage): Promise<void> {
     /* 无图片则按文本发送 */
   }
 
-  // 娱乐模式群：像普通群友一样直接发文本，不打"聊天记录"卡片、不 @ 提问者
+  // 娱乐模式群：按回复协议解析（文本/表情包/沉默），像普通群友一样直接发，不打卡片、不 @ 提问者
   if (trigger.kind === "group" && modes.isEntertainment(trigger.groupId!)) {
-    for (const chunk of splitText(text)) {
-      await sendSegments(trigger, [textSegment(chunk)]).catch((err) => log("[send] 失败:", err.message));
+    if (!result.ok) {
+      log(`[ent] 接话生成失败 -> 群 ${trigger.groupId}`);
+      return;
     }
+    await sendEntertainmentReply(trigger.groupId!, result.text ?? "", stickerLibrary.available(trigger.groupId!), "接话");
     return;
   }
 
@@ -907,13 +967,14 @@ async function buildPrompt(
   const said = trigger.text
     ? ` @你：\n${trigger.text}${imgNote}`
     : ` @了你${imgNote || "（对方没有说其他内容）"}`;
-  // 娱乐模式：走“群友口吻”那套提示词，与主动插话保持一致
+  // 娱乐模式：走“群友口吻”那套提示词 + 表情包回复协议，与主动插话保持一致
   if (modes.isEntertainment(trigger.groupId!)) {
     const entSaid = trigger.text ? `\n${trigger.text}${imgNote}` : `（@了你）${imgNote}`;
     return (
       `[娱乐模式·群聊] 你是 QQ 群「${name ?? trigger.groupId}」里的成员「${config.bot.nickname}」，` +
       `像真实群友一样说话：口语、简短、自然，别像助手或客服，别客套、别用书面语。\n` +
-      `发言者：${who}${entSaid}${linkBlock}`
+      `发言者：${who}${entSaid}${linkBlock}` +
+      stickerPrompt(stickerLibrary.available(trigger.groupId!))
     );
   }
   // 正常模式：附上群里最近的聊天记录，让 bot 看到大家正在聊什么（“(你自己)”标记的是 bot 之前说过的话）
