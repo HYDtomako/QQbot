@@ -7,7 +7,9 @@
   "scripts": {
     "bot": "node src/main.ts",
     "selftest:docparse": "node scripts/docparse-selftest.ts",
-    "selftest:stickers": "node scripts/stickers-selftest.ts && node scripts/stickers-smoke-selftest.ts"
+    "selftest:stickers": "node scripts/stickers-selftest.ts && node scripts/stickers-smoke-selftest.ts",
+    "stickers:sync": "node scripts/stickers-sync.ts",
+    "stickers:watch": "node scripts/stickers-watch.ts"
   },
   "dependencies": {
     "@napi-rs/canvas": "^1.0.9",

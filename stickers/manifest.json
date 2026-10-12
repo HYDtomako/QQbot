@@ -36,6 +36,24 @@
       "file": "鼓励.jpg",
       "name": "鼓励",
       "description": "安慰、打气、加油时用"
+    },
+    {
+      "id": "fa0d70845",
+      "file": "加油.jpg",
+      "name": "加油",
+      "description": ""
+    },
+    {
+      "id": "fc9593267",
+      "file": "反对.jpg",
+      "name": "反对",
+      "description": ""
+    },
+    {
+      "id": "ffc9c1251",
+      "file": "无辜.jpg",
+      "name": "无辜",
+      "description": ""
     }
   ]
 }
