@@ -18,6 +18,7 @@ import { KnowledgeService } from "./knowledge/service.ts";
 import type { KnowledgeTurn } from "./knowledge/types.ts";
 import { normalizeKnowledgeConfig } from "./knowledge/policy.ts";
 import { acceptedKnowledgeInput, isKnowledgeCommand, knowledgeContextPrompt } from "./knowledge/bridge.ts"
+import { compactPaReply, needsPaCleanup, PA_REPLY_MAX_CHARS } from "./pa-format.ts";
 
 const log = (...args: unknown[]) => console.log(new Date().toISOString(), ...args);
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -558,6 +559,11 @@ function writeChatLine(gid: string, u: string, n: string, m: string): void {
   } catch {
     /* 日志失败不影响主流程 */
   }
+}
+
+/** 与普通回复一致：走脱敏 + Markdown 清洗（PA 回发也按 QQ 纯文本发）。 */
+function cleanIncomingText(raw: string): string {
+  return redactSensitive(stripMarkdown(raw)).trim();
 }
 
 function logGroupChat(event: Record<string, unknown>): void {
@@ -1173,9 +1179,9 @@ function selectMemories(userId: string, query: string): { lines: string[]; total
 }
 
 /** 用一次无工具的 pi 调用执行文本任务（长期记忆合并等）。 */
-async function runPiText(prompt: string, timeoutMs = 90_000): Promise<string> {
+async function runPiText(prompt: string, timeoutMs = 90_000, model?: string): Promise<string> {
   const result = await runner.run(prompt, {
-    mode: "none", model: modelRegistry[currentModel], priority: "background", timeoutMs,
+    mode: "none", model, priority: "background", timeoutMs,
   });
   return result.ok ? result.text.trim() : "";
 }
@@ -1273,9 +1279,26 @@ async function flushBridgeOut(): Promise<void> {
       const item = JSON.parse(line) as { type?: string; id?: string; target?: { type?: string; id?: string }; text?: string };
       const kind = String(item.type ?? item.target?.type ?? "group");
       const id = String(item.id ?? item.target?.id ?? config.bot.defaultGroup ?? "");
-      const body = redactSensitive(String(item.text ?? ""));
+      const body = cleanIncomingText(String(item.text ?? ""));
       if (!id || !body) continue;
-      for (const chunk of splitText(body)) {
+      // PA 的完整报告（查证过程、进程号、路径）不整段转发：超长先让模型整理成简洁答复
+      let send = body;
+      if (needsPaCleanup(body)) {
+        let compact = "";
+        try {
+          compact = await compactPaReply(body, (p, t) =>
+            runPiText(p, t, modelRegistry[currentModel] || undefined), {
+            via: kind === "private" ? `private:${id}` : `group:${id}`,
+            maxChars: PA_REPLY_MAX_CHARS,
+          });
+        } catch (err) {
+          log("[bridge] 整理失败，改发原文:", err instanceof Error ? err.message : err);
+        }
+        // 短到不像答复（模型没好好输出）就按失败处理，宁发原文不丢内容
+        if (compact.length >= 6) send = cleanIncomingText(compact);
+        log(`[bridge] 长回复整理 ${body.length} → ${send === body ? "失败，原样发送" : send.length}`);
+      }
+      for (const chunk of splitText(send)) {
         await client.sendMessage(
           kind === "private"
             ? { message_type: "private", user_id: id, message: [textSegment(chunk)] }

@@ -77,7 +77,7 @@ const SCHEMA = {
   properties: {
     text: {
       type: "string",
-      description: "要转达给本机个人助手的完整内容。本机个人助手看不到 QQ 群聊，请写清背景与要它做什么。",
+      description: "要转达给本机个人助手的完整内容（对它的留言，不是给用户看的）。本机个人助手看不到 QQ 群聊，请写清背景与要它做什么。",
     },
     asker_qq: { type: "string", description: "提问者 QQ 号（从消息来源标注如实取，用于权限校验）" },
     via: {
@@ -101,6 +101,7 @@ export default function bridgeToolsExtension(pi: ExtensionAPI) {
       "这是即时转达：本工具会直接把留言推给本机个人助手开始处理，院长不用再在它页面上另发消息。",
       "asker_qq 必须如实取消息开头来源标注里的 QQ 号。",
       "via 必须如实填这条留言来自哪个会话：群聊填 group:<群号>，私聊填 private:<QQ号>（从来源标注取）。本机个人助手处理完会把结果回发到这里。",
+      "回发是给 QQ 里的人看的：只转发它针对原问题的简洁答复（结论与要点、纯文本），别把工作报告、查证过程或文件路径原样转过来。",
     ],
     parameters: SCHEMA,
     async execute(_id, params) {

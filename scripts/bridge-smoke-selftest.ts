@@ -110,6 +110,36 @@ try {
   assert.doesNotMatch(trace.at(-1).prompt, /旧会话不应进入|普通消息不应进入|合成旧偏好/);
   console.log("PASS actual main: entertainment excluded; disabled managed scope never falls back");
 
+  // 桥接回发：长报告先整理成简洁答复再发，短回发不经过整理
+  const longReport = "本机个人助手的完整报告。" + "查证过程与文件路径细节。".repeat(70); // 约 900 字
+  const shortReply = "今天没有课，安心休息。";
+  mkdirSync(path.join(temp, "memory", "bridge"), { recursive: true });
+  writeFileSync(path.join(temp, "memory", "bridge", "to-qq.jsonl"),
+    JSON.stringify({ t: new Date().toISOString(), type: "private", id: owner, text: longReport }) + "\n" +
+    JSON.stringify({ t: new Date().toISOString(), type: "private", id: owner, text: shortReply }) + "\n");
+  const privateSends = () => sent.filter(s => s.action === "send_msg" && s.params.message_type === "private");
+  await waitFor(() => privateSends().length >= 2, "bridge outbox forwarded");
+  await new Promise(resolve => setTimeout(resolve, 1500)); // 等两条回发都处理完
+  const forwarded = privateSends()
+    .flatMap(s => s.params.message.map((seg: any) => String(seg.data?.text ?? "")))
+    .map(t => t.trim());
+  assert.ok(!forwarded.includes(longReport.trim()), "long PA report must not be forwarded verbatim");
+  assert.ok(forwarded.includes(shortReply), "short PA reply must pass through unchanged");
+  const compacted = forwarded.find(t => t.includes("已重启"));
+  assert.ok(compacted, "compacted text was not forwarded");
+  assert.ok(compacted!.length <= 80, "compacted reply must stay short");
+  assert.doesNotMatch(compacted!, /PID|\\pi-napcatqq/, "compacted output must be sanitized");
+  // 整理用的提示词必须带上原文与「删掉过程细节」的约束，且不带工具
+  const callsAll = calls();
+  assert.ok(callsAll.some(c => c.prompt.includes(longReport) && /PID/.test(c.prompt)),
+    "compaction prompt must embed the full report and the strip-work-details rule");
+  const compactTrace = callsAll.find(c => c.prompt.includes("回复全文："));
+  assert.ok(compactTrace, "compaction must use the compact prompt");
+  assert.equal(compactTrace!.tools, "", "compaction call must run without tools");
+  const compactInput = readFileSync(path.join(temp, "sandbox", "last-compact-input.txt"), "utf8");
+  assert.ok(compactInput.includes(longReport), "fixture must receive the full report");
+  console.log("PASS actual main: long PA report compacted before QQ, short reply unchanged");
+
   const db = new DatabaseSync(path.join(temp, "memory", "knowledge.sqlite"), { readOnly: true });
   try {
     const sources = db.prepare("SELECT text FROM sources").all() as { text: string }[];
@@ -118,7 +148,7 @@ try {
     assert.ok(!sources.some(s => /普通消息|另一种学习路线|停用后/.test(s.text)));
   } finally { db.close(); }
   assert.doesNotMatch(output, /ReferenceError|TypeError|BAD: OLD CONTEXT LEAK/);
-  console.log("bridge-smoke-selftest: 4/4 passed (temporary main, fake OneBot, fixture model only)");
+  console.log("bridge-smoke-selftest: 5/5 passed (temporary main, fake OneBot, fixture model only)");
 } finally {
   if (child && child.exitCode === null && child.signalCode === null) {
     const closed = new Promise(resolve => child!.once("close", resolve));

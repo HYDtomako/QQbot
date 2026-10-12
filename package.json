@@ -13,6 +13,7 @@
     "selftest:knowledge": "node scripts/knowledge-selftest.ts",
     "selftest:runner": "node scripts/runner-selftest.ts",
     "selftest:bridge": "node scripts/bridge-smoke-selftest.ts",
+    "selftest:pa-format": "node scripts/pa-format-selftest.ts",
     "selftest:memory": "node scripts/runner-selftest.ts && node scripts/knowledge-selftest.ts && node scripts/knowledge-safety-selftest.ts && node scripts/legacy-guard-selftest.ts && node scripts/knowledge-integration-selftest.ts && node scripts/bridge-smoke-selftest.ts"
   },
   "dependencies": {
