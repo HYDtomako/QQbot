@@ -1003,22 +1003,23 @@ async function buildPrompt(
   const said = trigger.text
     ? ` @你：\n${trigger.text}${imgNote}`
     : ` @了你${imgNote || "（对方没有说其他内容）"}`;
+  // 群里最近的聊天记录：正常模式和娱乐模式都带上——别人只 @ 不说话时，近因是唯一的线索
+  const chatCtx = options.includeRecentChat === false ? "" : recentChatContext(trigger.groupId!, 20);
+  const chatBlock =
+    chatCtx && chatCtx !== "(暂无记录)" && chatCtx !== "(读取失败)"
+      ? `[群里最近的聊天记录（“(你自己)”标记的是你说过的话）]\n${chatCtx}\n\n`
+      : "";
   // 娱乐模式：走“群友口吻”那套提示词 + 表情包回复协议，与主动插话保持一致
   if (options.normalMode !== true && modes.isEntertainment(trigger.groupId!)) {
     const entSaid = trigger.text ? `\n${trigger.text}${imgNote}` : `（@了你）${imgNote}`;
     return (
       `[娱乐模式·群聊] 你是 QQ 群「${name ?? trigger.groupId}」里的成员「${config.bot.nickname}」，` +
       `像真实群友一样说话：口语、简短、自然，别像助手或客服，别客套、别用书面语。\n` +
-      `发言者：${who}${entSaid}${linkBlock}` +
+      `${chatBlock}发言者：${who}${entSaid}${linkBlock}` +
       stickerPrompt(stickerLibrary.available(trigger.groupId!))
     );
   }
-  // 正常模式：附上群里最近的聊天记录，让 bot 看到大家正在聊什么（“(你自己)”标记的是 bot 之前说过的话）
-  const chatCtx = options.includeRecentChat === false ? "" : recentChatContext(trigger.groupId!, 20);
-  const chatBlock =
-    chatCtx && chatCtx !== "(暂无记录)" && chatCtx !== "(读取失败)"
-      ? `[群里最近的聊天记录（“(你自己)”标记的是你说过的话）]\n${chatCtx}\n\n`
-      : "";
+  // 正常模式：同样带聊天记录，让 bot 看到大家正在聊什么（“(你自己)”标记的是 bot 之前说过的话）
   return (
     `[群聊] 群「${name ?? trigger.groupId}」（群号 ${trigger.groupId}）\n` +
     `${chatBlock}发言者：${who}${said}${linkBlock}`

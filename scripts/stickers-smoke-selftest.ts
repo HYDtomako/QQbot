@@ -162,6 +162,22 @@ try {
   await sleep(120);
   console.log("PASS 被 @：娱乐模式回复同样解析协议、可选表情包");
 
+  // ── 只 @ 不说话：提示词带上群里最近的聊天记录，模型能接着上文回 ──
+  const chatDir = path.join(temp, "memory", "group-chat");
+  mkdirSync(chatDir, { recursive: true });
+  writeFileSync(
+    path.join(chatDir, `g2-${ymd()}.jsonl`),
+    JSON.stringify({ t: new Date().toISOString(), u: "999", n: "合成群友", m: "SMOKE_BARE 这题也太难了" }) + "\n",
+  );
+  const beforeBare = calls().length;
+  emit("g2", "", true);
+  await waitFor(() => calls().length > beforeBare, "只@接话开始");
+  assert.match(calls().at(-1)!.prompt, /群里最近的聊天记录/);
+  assert.match(calls().at(-1)!.prompt, /合成群友: SMOKE_BARE 这题也太难了/);
+  await waitFor(() => lastMessage("g2").some((s: any) => s.data?.text === "接着上文说"), "只@回复接着上文");
+  await sleep(120);
+  console.log("PASS 只@不说话：提示词带上最近聊天记录，回复接着上文");
+
   // ── 被 @ + 表情包，按群隔离冷却（新群不受 g1 冷却影响）──
   emit("g4", "SMOKE_PICK", true);
   await waitFor(() => lastMessage("g4").some((s: any) => s.type === "image"), "@ 回复带图");
