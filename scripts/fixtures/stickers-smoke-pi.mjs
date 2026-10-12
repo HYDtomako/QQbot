@@ -13,4 +13,5 @@ else if (prompt.includes("SMOKE_UNKNOWN")) out = '{"text":"安全文字","sticke
 else if (prompt.includes("SMOKE_MISSING")) out = '{"text":"回退吧","sticker":"bubble"}';
 else if (prompt.includes("SMOKE_PICK")) out = '{"text":"配个图","sticker":"happy"}';
 else if (prompt.includes("SMOKE_HELLO")) out = '{"text":"在呢在呢","sticker":null}';
+else if (prompt.includes("SMOKE_BARE")) out = '{"text":"接着上文说","sticker":null}';
 console.log(out);
