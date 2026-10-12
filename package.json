@@ -9,7 +9,11 @@
     "selftest:docparse": "node scripts/docparse-selftest.ts",
     "selftest:stickers": "node scripts/stickers-selftest.ts && node scripts/stickers-smoke-selftest.ts",
     "stickers:sync": "node scripts/stickers-sync.ts",
-    "stickers:watch": "node scripts/stickers-watch.ts"
+    "stickers:watch": "node scripts/stickers-watch.ts",
+    "selftest:knowledge": "node scripts/knowledge-selftest.ts",
+    "selftest:runner": "node scripts/runner-selftest.ts",
+    "selftest:bridge": "node scripts/bridge-smoke-selftest.ts",
+    "selftest:memory": "node scripts/runner-selftest.ts && node scripts/knowledge-selftest.ts && node scripts/knowledge-safety-selftest.ts && node scripts/legacy-guard-selftest.ts && node scripts/knowledge-integration-selftest.ts && node scripts/bridge-smoke-selftest.ts"
   },
   "dependencies": {
     "@napi-rs/canvas": "^1.0.9",

@@ -22,6 +22,9 @@ export interface TriggeredMessage {
   userId: string;
   groupId?: string;
   text: string;
+  messageId?: string;
+  eventTimeMs?: number;
+  receivedAtMs?: number;
   /** 群聊时的发送者显示名（群名片优先，其次昵称），用于"回复 @谁"。 */
   senderName?: string;
   /** 群聊时发送者的群身份（owner/admin/member），来自事件 sender.role。 */
@@ -99,11 +102,17 @@ export function matchMessage(
   }
   text = text.trim();
   const hasContent = !!text || images.length > 0 || files.length > 0;
+  const eventTime = typeof event.time === "number" ? event.time * 1000 : undefined;
+  const source = {
+    messageId: event.message_id !== undefined && event.message_id !== null ? String(event.message_id) : undefined,
+    eventTimeMs: eventTime !== undefined && Number.isSafeInteger(eventTime) ? eventTime : undefined,
+    receivedAtMs: Date.now(),
+  };
 
   if (messageType === "private") {
     if (!hasContent) return null;
     if (!whitelist.has(userId)) return null;
-    return { kind: "private", userId, text, images, files, replyIds };
+    return { kind: "private", userId, text, images, files, replyIds, ...source };
   }
 
   if (messageType === "group") {
@@ -120,6 +129,7 @@ export function matchMessage(
     const sender = (event.sender ?? {}) as { card?: string; nickname?: string; role?: string };
     return {
       kind: "group",
+      ...source,
       userId,
       groupId: String(event.group_id ?? ""),
       text,

@@ -50,6 +50,19 @@
     "windowMs": 300000,
     "summarizeMinBytes": 1024
   },
+  "knowledge": {
+    "enabled": false,
+    "groups": [],
+    "privateUsers": [],
+    "automatic": true,
+    "extractIntervalMs": 600000,
+    "batchMaxMessages": 80,
+    "batchMaxChars": 12000,
+    "maxCallsPerScopePerHour": 6,
+    "rawRetentionDays": 7,
+    "candidateRetentionDays": 14,
+    "retrievalMaxChars": 3000
+  },
   "files": {
     "maxTextChars": 30000,
     "maxTotalChars": 60000,

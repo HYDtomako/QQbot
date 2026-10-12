@@ -32,6 +32,7 @@ interface ToolResult {
 import path from "node:path";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { isLegacyProtected } from "../knowledge-guard.ts";
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(MODULE_DIR, "../../..");
@@ -156,6 +157,8 @@ export default function memoryToolsExtension(pi: ExtensionAPI) {
     parameters: SCHEMA_REMEMBER,
     async execute(_id, params) {
       const asker = String(params.asker_qq ?? "").trim();
+      if (!/^[1-9]\d{4,19}$/.test(asker)) return text("QQ 号格式无效。");
+      if (isLegacyProtected("private", asker)) return text("该用户已由隔离记忆系统接管，不能读写旧记忆文件；请在对应私聊使用新记忆工具。");
       const owner = ownerQQ();
       if (!asker || asker !== owner) return text("只有院长可以让我记住事情。");
       const raw = String(params.text ?? "").trim();
@@ -200,7 +203,8 @@ export default function memoryToolsExtension(pi: ExtensionAPI) {
     parameters: SCHEMA_RECALL,
     async execute(_id, params) {
       const asker = String(params.asker_qq ?? "").trim();
-      if (!asker) return text("缺少提问者 QQ，无法查询。");
+      if (!/^[1-9]\d{4,19}$/.test(asker)) return text("QQ 号格式无效。");
+      if (isLegacyProtected("private", asker)) return text("该用户已由隔离记忆系统接管，不能读取旧记忆文件；请在对应私聊使用新记忆工具。");
       const entries = load(asker);
       if (entries.length === 0) return text("长期记忆里还没有任何条目。");
       const q = String(params.query ?? "").trim();
@@ -226,6 +230,8 @@ export default function memoryToolsExtension(pi: ExtensionAPI) {
     parameters: SCHEMA_FORGET,
     async execute(_id, params) {
       const asker = String(params.asker_qq ?? "").trim();
+      if (!/^[1-9]\d{4,19}$/.test(asker)) return text("QQ 号格式无效。");
+      if (isLegacyProtected("private", asker)) return text("该用户已由隔离记忆系统接管，不能读写旧记忆文件；请在对应私聊使用新记忆工具。");
       const owner = ownerQQ();
       if (!asker || asker !== owner) return text("只有院长可以删除记忆。");
       const target = String(params.target ?? "").trim();
