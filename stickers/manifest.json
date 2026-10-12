@@ -3,37 +3,37 @@
   "stickers": [
     {
       "id": "pressure",
-      "file": "pressure.png",
+      "file": "压力大.jpg",
       "name": "压力大",
       "description": "压力大、累了、被事情压住时用"
     },
     {
       "id": "bubble",
-      "file": "bubble.gif",
+      "file": "吃，冒泡.gif",
       "name": "吃／冒泡",
       "description": "吃东西或只是冒个泡时用"
     },
     {
       "id": "happy",
-      "file": "happy.png",
+      "file": "开心.jpg",
       "name": "开心",
       "description": "开心、被夸、气氛轻松时用"
     },
     {
       "id": "surprised",
-      "file": "surprised.png",
+      "file": "惊讶.jpg",
       "name": "惊讶",
       "description": "惊讶、没想到时用"
     },
     {
       "id": "confused",
-      "file": "confused.png",
+      "file": "蒙了.jpg",
       "name": "蒙了",
       "description": "懵了、没听懂、不知所措时用"
     },
     {
       "id": "encourage",
-      "file": "encourage.png",
+      "file": "鼓励.jpg",
       "name": "鼓励",
       "description": "安慰、打气、加油时用"
     }
