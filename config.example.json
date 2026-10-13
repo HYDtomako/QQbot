@@ -71,6 +71,12 @@
   "web": {
     "maxTextChars": 50000
   },
+  "entertainment": {
+    "replyFrequency": 0.3,
+    "media": {
+      "enabled": true
+    }
+  },
   "tasks": [
     {
       "name": "示例任务（可删）",

@@ -184,13 +184,14 @@ try {
   mkdirSync(chatDir, { recursive: true });
   writeFileSync(
     path.join(chatDir, `g2-${ymd()}.jsonl`),
-    JSON.stringify({ t: new Date().toISOString(), u: "999", n: "合成群友", m: "SMOKE_BARE 这题也太难了" }) + "\n",
+    JSON.stringify({ t: new Date().toISOString(), u: "999", n: "合成群友", m: "SMOKE_BARE 这题也太难了 [表情包:开心 (legacy-secret-id)]", entertainment: true }) + "\n",
   );
   const beforeBare = calls().length;
   emit("g2", "", true);
   await waitFor(() => calls().length > beforeBare, "只@接话开始");
   assert.match(calls().at(-1)!.prompt, /群里最近的聊天记录/);
-  assert.match(calls().at(-1)!.prompt, /合成群友: SMOKE_BARE 这题也太难了/);
+  assert.match(calls().at(-1)!.prompt, /合成群友（QQ 999）: SMOKE_BARE 这题也太难了 \[表情包\]/);
+  assert.doesNotMatch(calls().at(-1)!.prompt, /legacy-secret-id/);
   await waitFor(() => lastMessage("g2").some((s: any) => s.data?.text === "接着上文说"), "只@回复接着上文");
   await sleep(120);
   console.log("PASS 只@不说话：提示词带上最近聊天记录，回复接着上文");

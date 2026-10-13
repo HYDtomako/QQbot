@@ -1,5 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { describeEmoji, parseMessageContent } from "./message-content.ts";
 import type { OneBotClient } from "./onebot.ts";
 import { pickFileName, type FileRef, type ImageRef, type TriggeredMessage } from "./router.ts";
 import {
@@ -39,7 +42,7 @@ export interface MaterializedFile {
 }
 
 export interface Attachments {
-  collect(trigger: TriggeredMessage): Promise<{ images: ImageRef[]; files: FileRef[] }>;
+  collect(trigger: TriggeredMessage): Promise<{ images: ImageRef[]; files: FileRef[]; quotedText: string[] }>;
   materializeImages(images: ImageRef[]): Promise<string[]>;
   materializeFiles(files: FileRef[]): Promise<{ files: MaterializedFile[]; rejected: string[] }>;
   cleanup(): void;
@@ -54,13 +57,59 @@ const DEFAULT_MAX_TEXT_CHARS = 30_000; // 单文件文本上限，超出截断�
 const DEFAULT_MAX_TOTAL_CHARS = 60_000; // 单条消息所有附件的文本总量上限
 
 /** 按文件头识别真实类型，NapCat 缓存里的图片常无扩展名。 */
-function sniffExt(buf: Buffer): string {
+function sniffExt(buf: Buffer): string | null {
   if (buf.length >= 4 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return "png";
   if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "jpg";
   if (buf.length >= 4 && buf.toString("ascii", 0, 4) === "GIF8") return "gif";
   if (buf.length >= 12 && buf.toString("ascii", 8, 12) === "WEBP") return "webp";
   if (buf.length >= 2 && buf[0] === 0x42 && buf[1] === 0x4d) return "bmp";
-  return "png";
+  return null;
+}
+
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+export const MAX_IMAGES = 3;
+
+function imageDownloadUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return ["http:", "https:"].includes(url.protocol) && !url.username && !url.password
+      && (!url.port || url.port === "80" || url.port === "443")
+      && /(?:^|\.)(?:qq\.com|qpic\.cn|gtimg\.cn|gtimg\.com|qq\.net)$/.test(url.hostname);
+  } catch { return false; }
+}
+
+async function downloadImage(url: string): Promise<Buffer | null> {
+  if (!imageDownloadUrl(url)) return null;
+  const signal = AbortSignal.timeout(20_000);
+  for (let redirects = 0; redirects <= 3; redirects++) {
+    const response = await fetch(url, { signal, redirect: "manual" });
+    if (response.status >= 300 && response.status < 400) {
+      await response.body?.cancel();
+      const location = response.headers.get("location");
+      if (!location) return null;
+      url = new URL(location, url).href;
+      if (!imageDownloadUrl(url)) return null;
+      continue;
+    }
+    if (!response.ok || Number(response.headers.get("content-length")) > MAX_IMAGE_BYTES) {
+      await response.body?.cancel();
+      return null;
+    }
+    const reader = response.body?.getReader();
+    if (!reader) return null;
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) return Buffer.concat(chunks, size);
+        size += value.length;
+        if (size > MAX_IMAGE_BYTES) return null;
+        chunks.push(value);
+      }
+    } finally { await reader.cancel().catch(() => {}); }
+  }
+  return null;
 }
 
 /** 取末尾扩展名（小写）。只有形如 "xxx.md" 的结尾才算扩展名，避免把 "报告 v1.2" 当成后缀。 */
@@ -101,81 +150,73 @@ export function createAttachments(ctx: AttachmentCtx): Attachments {
   /** 三级兜底取图：本地路径 → NapCat get_image → CDN 下载；返回落地后的沙箱路径。 */
   async function materializeImages(images: ImageRef[]): Promise<string[]> {
     const out: string[] = [];
-    for (const [i, img] of images.entries()) {
-      const save = (buf: Buffer): string => {
-        const p = path.join(dir, `img-${Date.now()}-${i}.${sniffExt(buf)}`);
+    for (const [i, img] of images.slice(0, MAX_IMAGES).entries()) {
+      const save = (buf: Buffer): string | null => {
+        const ext = sniffExt(buf);
+        if (!ext || !buf.length || buf.length > MAX_IMAGE_BYTES) return null;
+        const p = path.join(dir, `img-${randomUUID()}.${ext}`);
         writeFileSync(p, buf);
         return p;
+      };
+      const fromLocal = (file: string): string | null => {
+        const p = file.startsWith("file://") ? fileURLToPath(file) : file;
+        if (!existsSync(p)) return null;
+        const stat = statSync(p);
+        return stat.isFile() && stat.size <= MAX_IMAGE_BYTES ? save(readFileSync(p)) : null;
       };
       let got: string | null = null;
       // 1) 直接本地路径（file 字段可能是绝对路径或 file:// URI）
       for (const c of [img.file].filter(Boolean) as string[]) {
-        const p = c.startsWith("file://") ? c.slice(7) : c;
         try {
-          if (existsSync(p) && statSync(p).isFile()) {
-            got = save(readFileSync(p));
-            break;
-          }
+          got = fromLocal(c);
+          if (got) break;
         } catch {
           /* 继续尝试下一级 */
         }
       }
       // 2) NapCat get_image（file 或 file_id）
       if (!got && (img.file || img.fileId)) {
-        const r = await client.getImage(img.file ?? img.fileId!);
-        if (r?.base64) got = save(Buffer.from(r.base64, "base64"));
-        else if (r?.path && existsSync(r.path)) got = save(readFileSync(r.path));
+        try {
+          const r = await client.getImage(img.file ?? img.fileId!);
+          if (r?.base64 && r.base64.length <= Math.ceil(MAX_IMAGE_BYTES / 3) * 4) got = save(Buffer.from(r.base64, "base64"));
+          else if (r?.path) got = fromLocal(r.path);
+        } catch { /* 继续尝试 CDN */ }
       }
       // 3) CDN 下载（腾讯域名，国内可直连）
       if (!got && img.url) {
         try {
-          const res = await fetch(img.url, { signal: AbortSignal.timeout(20_000), redirect: "follow" });
-          if (res.ok) {
-            const buf = Buffer.from(await res.arrayBuffer());
-            if (buf.length > 0 && buf.length <= 8 * 1024 * 1024) got = save(buf);
-          }
+          const buf = await downloadImage(img.url);
+          if (buf) got = save(buf);
         } catch {
           /* 落到失败分支 */
         }
       }
       if (got) out.push(got);
-      else log(`[image] 第 ${i + 1} 张图片获取失败（file=${img.file ?? "-"} fileId=${img.fileId ?? "-"} url=${img.url ? "有" : "无"}）`);
+      else log(`[image] 第 ${i + 1} 张图片未获取或格式/大小不支持`);
     }
     cleanup();
     return out;
   }
 
   /** 汇总附件：当前消息的图片/文件 + 引用消息里的图片/文件。 */
-  async function collect(trigger: TriggeredMessage): Promise<{ images: ImageRef[]; files: FileRef[] }> {
+  async function collect(trigger: TriggeredMessage): Promise<{ images: ImageRef[]; files: FileRef[]; quotedText: string[] }> {
     const images: ImageRef[] = [...(trigger.images ?? [])];
     const files: FileRef[] = [...(trigger.files ?? [])];
-    for (const rid of trigger.replyIds ?? []) {
+    const quotedText: string[] = [];
+    for (const rid of [...new Set(trigger.replyIds ?? [])].slice(0, 3)) {
       const msg = await client.getMsg(rid);
-      const segs = Array.isArray(msg?.message)
-        ? (msg.message as Array<{ type: string; data?: Record<string, unknown> }>)
-        : [];
-      for (const s of segs) {
-        if (s.type === "image") {
-          images.push({
-            file: typeof s.data?.file === "string" ? s.data.file : undefined,
-            fileId: typeof s.data?.file_id === "string" ? s.data.file_id : undefined,
-            url: typeof s.data?.url === "string" ? s.data.url : undefined,
-          });
-        } else if (s.type === "file") {
-          files.push({
-            fileId: typeof s.data?.file_id === "string" ? s.data.file_id : undefined,
-            name: pickFileName(s.data),
-            url: typeof s.data?.url === "string" ? s.data.url : undefined,
-          });
-        }
-      }
-      if (segs.length) {
-        log(
-          `[msg] 引用消息 ${rid}：${segs.filter((s) => s.type === "image").length} 图 / ${segs.filter((s) => s.type === "file").length} 文件`,
-        );
-      }
+      if (!msg) continue;
+      if (trigger.kind === "group" && String(msg.group_id ?? "") !== trigger.groupId) continue;
+      if (trigger.kind === "private" && msg.group_id) continue;
+      const content = parseMessageContent(msg.message);
+      images.push(...content.images);
+      files.push(...content.files);
+      const sender = (msg.sender ?? {}) as { user_id?: string | number; nickname?: string; card?: string };
+      const who = String(sender.card || sender.nickname || sender.user_id || msg.user_id || "未知发言者").replace(/[\r\n]/g, " ").slice(0, 80);
+      if (content.text) quotedText.push(`引用消息 ${rid}（${who}）：${describeEmoji(content.text).slice(0, 2000)}`);
+      log(`[msg] 引用消息 ${rid}：${content.images.length} 图 / ${content.files.length} 文件`);
     }
-    return { images, files };
+    return { images, files, quotedText };
   }
 
   /** 下载文件内容：NapCat get_file（base64/本地路径/直链）→ 消息段直链。回带 NapCat 里的文件名。 */

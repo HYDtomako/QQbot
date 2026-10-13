@@ -5,7 +5,13 @@ import { loadConfig } from "./config.ts";
 import { OneBotClient, type MessageSegment } from "./onebot.ts";
 import { matchMessage, type TriggeredMessage } from "./router.ts";
 import { createAttachments, type MaterializedFile } from "./attachments.ts";
-import { PiRunner } from "./runner.ts";
+import { PiRunner, type PiResult } from "./runner.ts";
+import { randomUUID } from "node:crypto";
+import { describeEmoji, parseMessageContent } from "./message-content.ts";
+import { chatDate, readRecentChat, renderChatMessage, MEDIA_CONTEXT_RULES } from "./group-chat.ts";
+import { MediaContext } from "./media-context.ts";
+import { ModeTurns, groupSessionKey, type ReplyTurn } from "./mode-turns.ts";
+import { normalReplyText, recordedReplyText } from "./reply-policy.ts";
 import { buildReply, splitForCard, splitText, textSegment, MAX_SEGMENT_LEN } from "./reply.ts";
 import { Antispam } from "./antispam.ts";
 import { TaskScheduler } from "./tasks.ts";
@@ -28,6 +34,7 @@ const config = loadConfig(path.join(root, "config.json"));
 const whitelist = new Set(config.bot.whitelist);
 const sandboxDir = path.join(root, "sandbox");
 const modes = new Modes(path.join(root, "modes.json"));
+const modeTurns = new ModeTurns(gid => modes.isEntertainment(gid));
 const stickerLibrary = new StickerLibrary(path.join(root, "stickers"));
 
 // ── 娱乐模式状态跟踪：机器人上次在每群说话的时间 ──
@@ -67,7 +74,7 @@ function entTextSignals(event: Record<string, unknown>): { hasQuestion: boolean;
     } else if (s.type === "at") {
       const qq = String(s.data?.qq ?? "");
       if (qq && qq !== config.bot.selfId) atOther = true;
-    } else if (["image", "face", "record", "video", "file", "forward"].includes(s.type)) {
+    } else if (["image", "face", "mface", "record", "video", "file", "forward"].includes(s.type)) {
       // 媒体类不计入“有文字”
     } else {
       onlyMedia = false;
@@ -123,12 +130,16 @@ function entertainmentOnGroupMessage(event: Record<string, unknown>, addressed: 
 async function proactiveSay(gid: string): Promise<void> {
   const st = entState(gid);
   if (st.busy) return;
+  const turn = modeTurns.begin(gid);
+  if (!turn.entertainment || !turn.isCurrent()) { turn.finish(); return; }
   st.busy = true;
   try {
     let name = groupNames.get(gid);
     if (!name) name = (await client.getGroupName(gid)) ?? undefined;
     if (name) groupNames.set(gid, name);
-    const ctx = recentChatContext(gid, 20);
+    await waitForRecentMedia(gid);
+    if (!turn.isCurrent()) return;
+    const ctx = recentChatContext(gid, 20, true);
     const choices = stickerLibrary.available(gid);
     const prompt =
       `[娱乐模式·主动插话] 你是 QQ 群「${name ?? gid}」里的成员「${config.bot.nickname}」，以真实群友的口吻参与闲聊。\n` +
@@ -137,13 +148,14 @@ async function proactiveSay(gid: string): Promise<void> {
       `- 不要 @ 任何人，不要客套、不要自我介绍、不要任何格式标记；\n` +
       `- 没有合适的话、你刚说过，或别人正在聊他们自己的事时，可以沉默。\n` +
       stickerPrompt(choices) +
-      `\n最近消息：\n${ctx}`;
-    const result = await runner.run(prompt, { mode: "web", model: modelRegistry[currentModel], env: legacyToolEnv() });
-    if (!result.ok) return;
-    await sendEntertainmentReply(gid, result.text ?? "", choices, "主动插话");
+      `\n${MEDIA_CONTEXT_RULES}\n最近消息：\n${ctx}`;
+    const result = await runner.run(prompt, { mode: "web", model: modelRegistry[currentModel], env: legacyToolEnv(), signal: turn.signal });
+    if (!result.ok || !turn.isCurrent()) return;
+    await sendEntertainmentReply(gid, result.text ?? "", choices, "主动插话", turn);
   } catch (err) {
     log("[ent] 主动插话失败:", err instanceof Error ? err.message : err);
   } finally {
+    turn.finish();
     st.busy = false;
   }
 }
@@ -152,7 +164,8 @@ async function proactiveSay(gid: string): Promise<void> {
  * 娱乐模式回复落地：解析回复协议 → 组装文本/表情包消息 → 发送并记账。
  * 表情包按 ID 校验后发送原文件字节；图片被明确拒绝时回退纯文字；协议解析不了整条放弃。
  */
-async function sendEntertainmentReply(gid: string, raw: string, choices: StickerEntry[], label: string): Promise<void> {
+async function sendEntertainmentReply(gid: string, raw: string, choices: StickerEntry[], label: string, turn: ReplyTurn): Promise<void> {
+  if (!turn.entertainment || !turn.isCurrent()) return;
   const reply = parseEntertainmentReply(raw, choices);
   if (!reply.valid) {
     log(`[ent] 忽略无法解析的回复 -> 群 ${gid}`);
@@ -177,6 +190,7 @@ async function sendEntertainmentReply(gid: string, raw: string, choices: Sticker
     if (!image && text.length > MAX_SEGMENT_LEN) {
       // 纯文字超长时按普通分片发送；带图的消息文字很短，不需要分片
       for (const chunk of splitText(text)) {
+        if (!turn.isCurrent()) return;
         await client.sendMessage({ message_type: "group", group_id: gid, message: [textSegment(chunk)] });
       }
     } else {
@@ -187,6 +201,7 @@ async function sendEntertainmentReply(gid: string, raw: string, choices: Sticker
       });
       // 超时或断线无法确认送达，只对明确的 API 拒绝回退，避免重复发送
       if ((sent.status !== "ok" || sent.retcode !== 0) && image && text) {
+        if (!turn.isCurrent()) return;
         log(`[ent] 图片发送被拒绝，回退文字 -> 群 ${gid}`);
         sent = await client.sendMessage({ message_type: "group", group_id: gid, message: [textSegment(text)] });
         sticker = undefined;
@@ -204,40 +219,49 @@ async function sendEntertainmentReply(gid: string, raw: string, choices: Sticker
     }
     groupLastBotAt.set(gid, ts);
     stickerLibrary.recordSent(gid, sticker?.id ?? null, ts);
-    // 记录只写人类可读的“发过图”，不写 id 这类内部协议标注：这段会回喂给模型，模型会照着抄
+    // 群聊历史会回喂模型，不能写入素材 ID 或内部协议标注。
     const content = [text, sticker ? "[表情包]" : ""].filter(Boolean).join(" ");
-    writeChatLine(gid, config.bot.selfId, config.bot.nickname, content);
+    writeChatLine(gid, config.bot.selfId, config.bot.nickname, content, true);
     log(`[ent] ${label} -> 群 ${gid}: ${content.slice(0, 80)}`);
   } catch (err) {
     log(`[ent] ${label}失败:`, err instanceof Error ? err.message : err);
   }
 }
 
-/** 读取今天该群最近的聊天记录，拼成给模型的上下文。 */
-function recentChatContext(gid: string, limit: number): string {
+/** 异步图片摘要合并回原发言；跨午夜保留前一天的近期消息。 */
+function recentChatContext(gid: string, limit: number, entertainment: boolean): string {
   try {
-    const now = new Date();
-    const ymd = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-    const p = path.join(chatLogDir, `${gid}-${ymd}.jsonl`);
-    if (!existsSync(p)) return "(暂无记录)";
-    const lines = readFileSync(p, "utf8").trim().split("\n").filter(Boolean).slice(-limit);
-    const out = lines
-      .map((l) => {
-        try {
-          const o = JSON.parse(l) as { u?: string; n?: string; m?: string };
-          const who = o.u === config.bot.selfId ? "(你自己)" : o.n || o.u || "?";
-          // 历史记录里的旧标注 [表情包:名称 (id)] 是内部协议，回喂会被模型照抄，这里洗成人类可读形式
-          const msg = (o.m ?? "").replace(/\[表情包:[^\]]*\]/g, "[表情包]");
-          return `${who}: ${msg}`;
-        } catch {
-          return "";
-        }
-      })
-      .filter(Boolean);
-    return out.length ? out.join("\n") : "(暂无记录)";
+    const entries = readRecentChat(chatLogDir, gid, limit)
+      .filter(e => e.entertainment === entertainment);
+    const out = entries.map(e => {
+      const isBot = e.u === config.bot.selfId;
+      const who = isBot ? "(你自己)" : `${e.n || e.u}（QQ ${e.u}）`;
+      const description = e.id ? mediaContext.getDescriptions(gid, e.id) : [];
+      const text = renderChatMessage(e, description).replace(/\[表情包:[^\]]*\]/g, "[表情包]");
+      const content = isBot ? recordedReplyText(text) : text;
+      return content ? `[${e.t}${e.id ? ` 消息 ${e.id}` : ""}] ${who}: ${content}` : "";
+    }).filter(Boolean);
+    const selected: string[] = [];
+    let chars = 0;
+    for (const line of out.reverse()) {
+      const bounded = line.slice(0, 4000);
+      if (chars + bounded.length > 16_000) break;
+      selected.unshift(bounded);
+      chars += bounded.length;
+    }
+    return selected.length ? selected.join("\n") : "(暂无记录)";
   } catch {
     return "(读取失败)";
   }
+}
+
+async function waitForRecentMedia(gid: string, userId?: string): Promise<void> {
+  if (config.entertainment?.media?.enabled === false) return;
+  const cutoff = Date.now() - 3 * 60_000;
+  const ids = readRecentChat(chatLogDir, gid, 20)
+    .filter(e => e.id && e.mediaCount && Date.parse(e.t) >= cutoff && (!userId || e.u === userId))
+    .map(e => e.id!);
+  if (ids.length) await mediaContext.waitFor(gid, ids, 12_000);
 }
 
 const client = new OneBotClient(config.onebot.wsUrl, config.onebot.token);
@@ -296,6 +320,7 @@ if (knowledge) await knowledge.start();
 function legacyToolEnv(): Record<string, string> {
   const rows = knowledge?.store.db.prepare("SELECT scope FROM scope_policies WHERE ever_enabled=1").all() as { scope: string }[] | undefined;
   return {
+    QQ_BOT_SELF_ID: config.bot.selfId,
     QQ_KNOWLEDGE_PROTECTED_GROUPS: JSON.stringify([...new Set([
       ...(config.knowledge?.enabled ? config.knowledge.groups ?? [] : []),
       ...(rows ?? []).filter(r => r.scope.startsWith("group:")).map(r => r.scope.slice(6)),
@@ -378,15 +403,22 @@ async function handleModeCommand(trigger: TriggeredMessage, action: "on" | "off"
     return;
   }
   const on = action === "on";
+  const changed = modes.isEntertainment(groupId) !== on;
   modes.setEntertainment(groupId, on);
+  if (changed) {
+    modeTurns.invalidate(groupId);
+    entStates.delete(groupId);
+  }
+  if (!on) mediaContext.cancelGroup(groupId);
   await replyText(trigger, `娱乐模式已${on ? "开启" : "关闭"}：群 ${groupId}。`);
   log(`[modes] ${trigger.userId} -> 娱乐模式${on ? "开启" : "关闭"} 群 ${groupId}`);
 }
 
-async function replyText(trigger: TriggeredMessage, text: string): Promise<void> {
+async function replyText(trigger: TriggeredMessage, text: string, turn?: ReplyTurn): Promise<void> {
   // 桥接直接回复也统一过脱敏（密钥/内网IP/出口IP），与 pi 回复同一标准
   for (const segs of buildReply(trigger, redactSensitive(text))) {
-    await sendSegments(trigger, segs).catch((err) => log("[send] 失败:", err.message));
+    if (turn && !turn.isCurrent()) return;
+    await sendSegments(trigger, segs, turn).catch((err) => log("[send] 失败:", err.message));
   }
 }
 
@@ -552,16 +584,15 @@ const antispam = new Antispam(
 const chatLogDir = path.join(root, "memory", "group-chat");
 mkdirSync(chatLogDir, { recursive: true });
 
-function writeChatLine(gid: string, u: string, n: string, m: string): void {
+function appendChatRecord(gid: string, record: Record<string, unknown>, date = new Date()): void {
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(gid)) return;
   try {
-    if (!gid || !m.trim()) return;
-    const now = new Date();
-    const ymd = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-    const line = JSON.stringify({ t: now.toISOString(), u, n, m }) + "\n";
-    writeFileSync(path.join(chatLogDir, `${gid}-${ymd}.jsonl`), line, { flag: "a" });
-  } catch {
-    /* 日志失败不影响主流程 */
-  }
+    writeFileSync(path.join(chatLogDir, `${gid}-${chatDate(date)}.jsonl`), JSON.stringify(record) + "\n", { flag: "a" });
+  } catch { /* 日志失败不影响主流程 */ }
+}
+
+function writeChatLine(gid: string, u: string, n: string, m: string, entertainment = modes.isEntertainment(gid)): void {
+  if (m.trim()) appendChatRecord(gid, { t: new Date().toISOString(), u, n, m, entertainment });
 }
 
 /** 与普通回复一致：走脱敏 + Markdown 清洗（PA 回发也按 QQ 纯文本发）。 */
@@ -575,16 +606,25 @@ function logGroupChat(event: Record<string, unknown>): void {
     if (!gid) return;
     const sender = (event.sender ?? {}) as { card?: string; nickname?: string };
     const name = sender.card || sender.nickname || String(event.user_id ?? "");
-    const segs = Array.isArray(event.message) ? (event.message as Array<{ type: string; data?: Record<string, unknown> }>) : [];
-    let content = "";
-    for (const s of segs) {
-      if (s.type === "text") content += String(s.data?.text ?? "").trim();
-      else if (s.type === "image") content += content ? " [图片]" : "[图片]";
-      else if (s.type === "face") content += "[表情]";
-      else if (s.type === "forward") content += "[聊天记录]";
+    const content = parseMessageContent(event.message, config.bot.selfId);
+    if (!content.contextText) return;
+    const userId = String(event.user_id ?? "");
+    const id = String(event.message_id ?? `received-${randomUUID()}`);
+    event.message_id = id;
+    const now = new Date();
+    appendChatRecord(gid, {
+      t: now.toISOString(), u: userId, n: name, m: describeEmoji(content.contextText), id,
+      mediaCount: content.images.length, entertainment: modes.isEntertainment(gid),
+    }, now);
+    if (content.images.length && userId !== config.bot.selfId && modes.isEntertainment(gid)
+      && config.entertainment?.media?.enabled !== false) {
+      void mediaContext.observe({ groupId: gid, userId, messageId: id, receivedAtMs: now.getTime(), images: content.images })
+        .then(descriptions => {
+          if (descriptions.length && modes.isEntertainment(gid) && mediaContext.getDescriptions(gid, id).length) {
+            appendChatRecord(gid, { kind: "media", id, descriptions }, now);
+          }
+        }).catch(() => log("[media] 图片上下文处理失败"));
     }
-    if (!content) return; // 纯图片/无文本内容不入日志
-    writeChatLine(gid, String(event.user_id ?? ""), name, content);
   } catch {
     /* 日志失败不影响主流程 */
   }
@@ -661,6 +701,12 @@ client.onEvent((event) => {
   if (event.post_type === "notice" && (event.notice_type === "group_recall" || event.notice_type === "friend_recall")) {
     const scope = event.notice_type === "group_recall" ? `group:${String(event.group_id ?? "")}` : `private:${String(event.user_id ?? "")}`;
     knowledge?.retract(scope, String(event.message_id ?? ""));
+    if (event.notice_type === "group_recall") {
+      const gid = String(event.group_id ?? "");
+      const id = String(event.message_id ?? "");
+      mediaContext.remove(gid, id);
+      appendChatRecord(gid, { kind: "recall", id });
+    }
     return;
   }
   if (event.post_type !== "message") return;
@@ -668,11 +714,11 @@ client.onEvent((event) => {
     logGroupChat(event);
     antispam.checkGroupMessage(event).catch((err) => log("[antispam] 异常:", err));
   }
-  // 调试：非纯文本消息记录段类型与段数据（排查图片/文件/引用等链路）
+  // 下载链接可能携带临时凭据，调试仅记录来源和段类型。
   const segs = Array.isArray(event.message) ? (event.message as Array<{ type: string; data?: unknown }>) : [];
   if (segs.some((s) => s.type !== "text" && s.type !== "at")) {
     log(
-      `[msg] 段类型: ${segs.map((s) => s.type).join(" + ")} | 段数据: ${JSON.stringify(segs.filter((s) => s.type !== "text" && s.type !== "at").map((s) => s.data)).slice(0, 400)}`,
+      `[msg] ${event.message_type}/${event.group_id ?? event.user_id} 消息 ${event.message_id ?? "?"} 段类型: ${segs.map((s) => s.type).join(" + ")}`,
     );
   }
   const trigger = matchMessage(event, config.bot.selfId, whitelist, config.bot.atAliases);
@@ -695,11 +741,11 @@ const pendingByKey = new Map<string, Promise<PiResult>>();
 
 
 /** 旧窗口摘要：用当前模型跑一次无工具的廉价调用。失败返回空（不带摘要继续）。 */
-async function summarizeSession(file: string): Promise<string> {
+async function summarizeSession(file: string, signal: AbortSignal): Promise<string> {
   const spec = modelRegistry[currentModel];
   if (!spec) return "";
   const result = await runner.run(SUMMARIZE_PROMPT, {
-    mode: "none", model: spec, sessionFile: file, timeoutMs: 60000, priority: "interactive",
+    mode: "none", model: spec, sessionFile: file, timeoutMs: 60000, priority: "interactive", signal,
   });
   return result.ok ? result.text.trim().slice(0, 2000) : "";
 }
@@ -708,7 +754,7 @@ async function summarizeSession(file: string): Promise<string> {
  * 取得指定上下文的会话文件：窗口活跃则续接；过期则归档旧窗口并惰性生成摘要。
  * 键：私聊 `user-<QQ号>`，群聊 `group-<群号>`（整群共享一个上下文）。
  */
-async function memorySessionFor(ctxKey: string): Promise<{ file: string; summary: string }> {
+async function memorySessionFor(ctxKey: string, signal: AbortSignal): Promise<{ file: string; summary: string }> {
   const now = Date.now();
   const file = path.join(memoryDir, `${ctxKey}.jsonl`);
   const win = sessionWindows.get(ctxKey);
@@ -726,7 +772,7 @@ async function memorySessionFor(ctxKey: string): Promise<{ file: string; summary
     const archive = path.join(memoryArchiveDir, `${ctxKey}-${stamp}.jsonl`);
     try {
       renameSync(file, archive);
-      summary = await summarizeSession(archive);
+      summary = await summarizeSession(archive, signal);
       if (summary) log(`[memory] ${ctxKey} 旧窗口已压缩（${Math.round(statSync(archive).size / 1024)}KB）`);
     } catch (err) {
       log("[memory] 归档/压缩失败:", err instanceof Error ? err.message : err);
@@ -796,7 +842,17 @@ async function handleTrigger(trigger: TriggeredMessage): Promise<void> {
     return;
   }
 
-  const normalAtEntry = trigger.kind !== "group" || !modes.isEntertainment(trigger.groupId!);
+  const turn = modeTurns.begin(trigger.kind === "group" ? trigger.groupId : undefined);
+  try {
+    await handleReplyTurn(trigger, turn);
+  } finally {
+    turn.finish();
+  }
+}
+
+async function handleReplyTurn(trigger: TriggeredMessage, turn: ReplyTurn): Promise<void> {
+  const normalAtEntry = !turn.entertainment;
+  const cancelled: PiResult = { ok: false, text: "模式已切换，本轮已取消", durationMs: 0 };
   const memoryInput = acceptedKnowledgeInput(trigger, normalAtEntry);
   const memoryCommand = isKnowledgeCommand(trigger.text)
     ? !normalAtEntry ? "娱乐模式不使用这套记忆，请在正常模式下管理。"
@@ -804,42 +860,57 @@ async function handleTrigger(trigger: TriggeredMessage): Promise<void> {
       : "自动记忆尚未配置。请设置 knowledge.enabled 和允许的 groups/privateUsers，再重启后在对应范围开启记忆。"
     : undefined;
   if (memoryCommand !== undefined) {
-    await replyText(trigger, memoryCommand);
+    await replyText(trigger, memoryCommand, turn);
     return;
   }
 
   // 同一上下文串行：群聊按群共享会话文件（避免并发写同一文件），私聊按用户
   const runStart = Date.now();
   const ctxKey = trigger.kind === "group" ? `group-${trigger.groupId}` : `user-${trigger.userId}`;
+  const sessionKey = trigger.kind === "group" ? groupSessionKey(trigger.groupId!, turn.entertainment) : ctxKey;
   const prev = pendingByKey.get(ctxKey) ?? Promise.resolve();
   const task = prev.catch(() => undefined).then(async () => {
+    if (!turn.isCurrent()) return cancelled;
     const managed = normalAtEntry && !!knowledge?.isManaged(memoryInput);
-    const session = managed ? { file: undefined, summary: "" } : await memorySessionFor(ctxKey);
-    const { images, files } = await attachments.collect(trigger);
+    if (turn.entertainment && !trigger.images?.length) {
+      await waitForRecentMedia(trigger.groupId!, trigger.userId);
+    }
+    if (!turn.isCurrent()) return cancelled;
+    const session = managed ? { file: undefined, summary: "" } : await memorySessionFor(sessionKey, turn.signal);
+    if (!turn.isCurrent()) return cancelled;
+    const { images, files, quotedText } = await attachments.collect(trigger);
+    if (!turn.isCurrent()) return cancelled;
     const { files: readyFiles, rejected } = files.length
       ? await attachments.materializeFiles(files)
       : { files: [], rejected: [] };
+    if (!turn.isCurrent()) return cancelled;
     const imagePaths = images.length ? await attachments.materializeImages(images) : [];
+    if (!turn.isCurrent()) return cancelled;
+    const attachmentInfo = { missingImages: images.length - imagePaths.length, quotedText, entertainment: turn.entertainment };
     if (managed && knowledge) {
-      let turn: KnowledgeTurn = { env: {}, contextBlock: "" };
-      try { turn = await knowledge.prepareTurn(memoryInput); }
+      let knowledgeTurn: KnowledgeTurn = { env: {}, contextBlock: "" };
+      try { knowledgeTurn = await knowledge.prepareTurn(memoryInput); }
       catch { log("[knowledge] 采集失败，本轮不使用记忆凭据"); }
       let result: PiResult = { ok: false, text: "记忆问答未完成", durationMs: 0 };
       try {
-        const prompt = knowledgeContextPrompt(turn) + await buildPrompt(trigger, images.length, readyFiles, rejected, {
-          includeRecentChat: false, normalMode: true,
+        if (!turn.isCurrent()) return cancelled;
+        const prompt = knowledgeContextPrompt(knowledgeTurn) + await buildPrompt(trigger, imagePaths.length, readyFiles, rejected, {
+          includeRecentChat: false, ...attachmentInfo,
         });
+        if (!turn.isCurrent()) return cancelled;
         result = await runner.run(prompt, {
-          mode: "knowledge", model: modelRegistry[currentModel], env: { ...legacyToolEnv(), ...turn.env },
-          imagePaths: [...imagePaths, ...readyFiles.map((f) => f.path)],
+          mode: "knowledge", model: modelRegistry[currentModel], env: { ...legacyToolEnv(), ...knowledgeTurn.env },
+          imagePaths: [...imagePaths, ...readyFiles.map((f) => f.path)], signal: turn.signal,
         });
-        if (!knowledge.isTurnCurrent(turn)) {
+        if (!turn.isCurrent()) result = cancelled;
+        if (!knowledge.isTurnCurrent(knowledgeTurn)) {
           result = { ok: false, text: "本次记忆权限或资料已撤销，已停止使用旧上下文，请重新提问。", durationMs: result.durationMs };
         }
         return result;
       } finally {
-        await knowledge.finishTurn(turn, { ok: result.ok, text: redactSensitive(stripMarkdown(result.text)) })
-          .catch(() => log("[knowledge] 回复上下文保存失败"));
+        await knowledge.finishTurn(knowledgeTurn, {
+          ok: result.ok && turn.isCurrent(), text: redactSensitive(stripMarkdown(normalReplyText(result.text, trigger.text))),
+        }).catch(() => log("[knowledge] 回复上下文保存失败"));
       }
     }
     const legacyPersonalAllowed = !knowledge?.isManaged({ ...memoryInput, kind: "private", groupId: undefined });
@@ -849,18 +920,35 @@ async function handleTrigger(trigger: TriggeredMessage): Promise<void> {
       : "";
     const prompt = memoBlock + (session.summary
       ? `[此前${trigger.kind === "group" ? "本群的" : "与该用户的"}对话摘要（更早内容已压缩）]\n${session.summary}\n\n`
-      : "") + await buildPrompt(trigger, images.length, readyFiles, rejected);
+      : "") + await buildPrompt(trigger, imagePaths.length, readyFiles, rejected, attachmentInfo);
+    if (!turn.isCurrent()) return cancelled;
     if (legacyPersonalAllowed) maybeMergeMemories(trigger.userId).catch(() => {});
-    return runner.run(prompt, {
+    const result = await runner.run(prompt, {
       mode: "web", model: modelRegistry[currentModel], sessionFile: session.file, env: legacyToolEnv(),
-      imagePaths: [...imagePaths, ...readyFiles.map((f) => f.path)],
+      imagePaths: [...imagePaths, ...readyFiles.map((f) => f.path)], signal: turn.signal,
     });
+    if (trigger.kind === "group" && normalAtEntry && turn.isCurrent() && result.ok
+      && normalReplyText(result.text, trigger.text) !== result.text && session.file) {
+      try {
+        if (existsSync(session.file)) {
+          renameSync(session.file, path.join(memoryArchiveDir, `protocol-${sessionKey}-${randomUUID()}.jsonl`));
+        }
+        sessionWindows.delete(sessionKey);
+        log(`[modes] 已隔离协议异常会话 -> ${ctxKey}`);
+      } catch { log(`[modes] 协议异常会话隔离失败 -> ${ctxKey}`); }
+    }
+    return result;
   });
   pendingByKey.set(ctxKey, task);
-  const result = await task;
-  if (pendingByKey.get(ctxKey) === task) pendingByKey.delete(ctxKey);
+  let result: PiResult;
+  try { result = await task; }
+  finally { if (pendingByKey.get(ctxKey) === task) pendingByKey.delete(ctxKey); }
+  if (!turn.isCurrent()) {
+    log(`[modes] 丢弃已失效回复 -> ${ctxKey}`);
+    return;
+  }
 
-  const raw = result.text || "(空回复)";
+  const raw = (normalAtEntry ? normalReplyText(result.text, trigger.text) : result.text) || "(空回复)";
   const text = redactSensitive(stripMarkdown(raw));
   log(`[result] ${trigger.userId} ok=${result.ok} ${result.durationMs}ms`);
 
@@ -869,9 +957,9 @@ async function handleTrigger(trigger: TriggeredMessage): Promise<void> {
   if (imgMatch) {
     const imgPath = imgMatch[1].trim();
     if (existsSync(imgPath)) {
-      await sendSegments(trigger, [{ type: "image", data: { file: "base64://" + readFileSync(imgPath).toString("base64") } }]);
+      await sendSegments(trigger, [{ type: "image", data: { file: "base64://" + readFileSync(imgPath).toString("base64") } }], turn);
       const rest = text.replace(/\[\[IMG:[^\]]+\]\]/, "").trim();
-      if (rest) await replyText(trigger, rest);
+      if (rest) await replyText(trigger, rest, turn);
       return;
     }
   }
@@ -886,8 +974,8 @@ async function handleTrigger(trigger: TriggeredMessage): Promise<void> {
     if (newest) {
       await sendSegments(trigger, [
         { type: "image", data: { file: "base64://" + readFileSync(path.join(schedDir, newest.f)).toString("base64") } },
-      ]);
-      if (text.trim()) await replyText(trigger, text);
+      ], turn);
+      if (text.trim()) await replyText(trigger, text, turn);
       return;
     }
   } catch {
@@ -895,12 +983,12 @@ async function handleTrigger(trigger: TriggeredMessage): Promise<void> {
   }
 
   // 娱乐模式群：按回复协议解析（文本/表情包/沉默），像普通群友一样直接发，不打卡片、不 @ 提问者
-  if (trigger.kind === "group" && modes.isEntertainment(trigger.groupId!)) {
+  if (turn.entertainment) {
     if (!result.ok) {
       log(`[ent] 接话生成失败 -> 群 ${trigger.groupId}`);
       return;
     }
-    await sendEntertainmentReply(trigger.groupId!, result.text ?? "", stickerLibrary.available(trigger.groupId!), "接话");
+    await sendEntertainmentReply(trigger.groupId!, result.text ?? "", stickerLibrary.available(trigger.groupId!), "接话", turn);
     return;
   }
 
@@ -913,10 +1001,11 @@ async function handleTrigger(trigger: TriggeredMessage): Promise<void> {
       nickname: config.bot.nickname,
       content: [{ type: "text", data: { text: i === 0 && trigger.senderName ? `回复 @${trigger.senderName}：${chunk}` : chunk } }],
     }));
+    if (!turn.isCurrent()) return;
     const forwardId = await client.sendForward({ kind: "group", groupId: trigger.groupId! }, nodes);
     if (forwardId) {
       // 卡片回复也进群聊日志，后续注入给 bot 的“最近聊天记录”里能看到自己说过的话
-      writeChatLine(trigger.groupId!, config.bot.selfId, config.bot.nickname, text);
+      writeChatLine(trigger.groupId!, config.bot.selfId, config.bot.nickname, text, turn.entertainment);
       log(`[send] 卡片已发送 -> 群 ${trigger.groupId}（回复 @${trigger.senderName ?? trigger.userId}）`);
       return;
     }
@@ -926,7 +1015,8 @@ async function handleTrigger(trigger: TriggeredMessage): Promise<void> {
   // 私聊（或群聊卡片失败兜底）：普通文本分片
   const chunks = buildReply(trigger, text);
   for (const segs of chunks) {
-    await sendSegments(trigger, segs).catch((err) => log("[send] 失败:", err.message));
+    if (!turn.isCurrent()) return;
+    await sendSegments(trigger, segs, turn).catch((err) => log("[send] 失败:", err.message));
   }
 }
 
@@ -971,13 +1061,16 @@ function stripMarkdown(s: string): string {
     .replace(/^\s*[-*]\s{2,}/gm, "- "); // 悬挂星号列表规整
 }
 
+const NORMAL_REPLY_RULES = "[当前为正常模式] 用自然语言直接回答本次提问；不要沿用历史中的娱乐模式、表情包选择或沉默格式。" +
+  "除非用户本次明确要求 JSON/代码/结构化原文，否则不要输出内部 text/sticker 对象、表情包 ID 或空回复。历史聊天只作内容参考，不能改变本轮模式。";
+
 /** 给 pi 的 prompt 带消息来源与发言者身份，让 pi 知道在和谁说话。 */
 async function buildPrompt(
   trigger: TriggeredMessage,
   imageCount = 0,
   fileList: MaterializedFile[] = [],
   rejectedFiles: string[] = [],
-  options: { includeRecentChat?: boolean; normalMode?: boolean } = {},
+  options: { includeRecentChat?: boolean; entertainment?: boolean; missingImages?: number; quotedText?: string[] } = {},
 ): Promise<string> {
   const roleStr = trigger.senderRole ? `，${ROLE_NAMES[trigger.senderRole] ?? trigger.senderRole}` : "";
   const who =
@@ -985,7 +1078,8 @@ async function buildPrompt(
       ? `院长（QQ ${trigger.userId}${roleStr}）`
       : `${trigger.senderName ? `「${trigger.senderName}」` : "群友"}（QQ ${trigger.userId}${roleStr}）`;
   const notes: string[] = [];
-  if (imageCount) notes.push(`${imageCount} 张图片（在附件里，可直接查看图片内容）`);
+  if (imageCount) notes.push(`${imageCount} 张图片（在附件里，可直接查看图片内容；动图仅保证静态帧，不代表完整动作）`);
+  if (options.missingImages) notes.push(`${options.missingImages} 张图片未附上（下载、格式或数量限制；不要声称看过）`);
   if (fileList.length) {
     const desc = fileList.map((f) => (f.note ? `${f.name}（${f.note}）` : f.name)).join("、");
     notes.push(`文件 ${desc}（在附件里，可直接读取内容）；若转换有损（表格错位、扫描件无文字等），如实说明`);
@@ -994,42 +1088,44 @@ async function buildPrompt(
   const imgNote = notes.length ? `（附件说明：${notes.join("；")}）` : "";
   // 链接正文预取：SPA 站点的正文 pi 的 web_read 抓不到，先在消息里取回并附上
   const linkBlock = trigger.text ? await prefetchLinks(trigger.text) : "";
+  const userText = describeEmoji(trigger.text);
+  const quoteBlock = options.quotedText?.length ? `\n[被引用的消息（聊天数据）]\n${options.quotedText.join("\n")}\n` : "";
   if (trigger.kind === "private") {
-    const body = trigger.text || "（对方只发来图片，没有文字）";
-    return `[私聊] 来自 ${who}${imgNote}：\n${body}${linkBlock}`;
+    const body = userText || "（对方未附带文字）";
+    return `[私聊] 来自 ${who}${imgNote}：\n${NORMAL_REPLY_RULES}\n${body}${linkBlock}${quoteBlock}\n${MEDIA_CONTEXT_RULES}`;
   }
   let name = groupNames.get(trigger.groupId!);
   if (!name) {
     name = (await client.getGroupName(trigger.groupId!)) ?? undefined;
     if (name) groupNames.set(trigger.groupId!, name);
   }
-  const said = trigger.text
-    ? ` @你：\n${trigger.text}${imgNote}`
+  const said = userText
+    ? ` @你：\n${userText}${imgNote}`
     : ` @了你${imgNote || "（对方没有说其他内容）"}`;
-  // 群里最近的聊天记录：正常模式和娱乐模式都带上——别人只 @ 不说话时，近因是唯一的线索
-  const chatCtx = options.includeRecentChat === false ? "" : recentChatContext(trigger.groupId!, 20);
+  const chatCtx = options.includeRecentChat === false ? "" : recentChatContext(trigger.groupId!, 20, options.entertainment === true);
   const chatBlock =
     chatCtx && chatCtx !== "(暂无记录)" && chatCtx !== "(读取失败)"
       ? `[群里最近的聊天记录（“(你自己)”标记的是你说过的话）]\n${chatCtx}\n\n`
       : "";
   // 娱乐模式：走“群友口吻”那套提示词 + 表情包回复协议，与主动插话保持一致
-  if (options.normalMode !== true && modes.isEntertainment(trigger.groupId!)) {
-    const entSaid = trigger.text ? `\n${trigger.text}${imgNote}` : `（@了你）${imgNote}`;
+  if (options.entertainment === true) {
+    const entSaid = userText ? `\n${userText}${imgNote}` : `（@了你）${imgNote}`;
     return (
       `[娱乐模式·群聊] 你是 QQ 群「${name ?? trigger.groupId}」里的成员「${config.bot.nickname}」，` +
       `像真实群友一样说话：口语、简短、自然，别像助手或客服，别客套、别用书面语。\n` +
-      `${chatBlock}发言者：${who}${entSaid}${linkBlock}` +
+      `${MEDIA_CONTEXT_RULES}\n${chatBlock}发言者：${who}${entSaid}${linkBlock}${quoteBlock}` +
       stickerPrompt(stickerLibrary.available(trigger.groupId!))
     );
   }
-  // 正常模式：同样带聊天记录，让 bot 看到大家正在聊什么（“(你自己)”标记的是 bot 之前说过的话）
   return (
     `[群聊] 群「${name ?? trigger.groupId}」（群号 ${trigger.groupId}）\n` +
-    `${chatBlock}发言者：${who}${said}${linkBlock}`
+    `${NORMAL_REPLY_RULES}\n${MEDIA_CONTEXT_RULES}\n${chatBlock}发言者：${who}${said}${linkBlock}${quoteBlock}`
   );
 }
 
-async function sendSegments(trigger: TriggeredMessage, segs: MessageSegment[]): Promise<void> {
+async function sendSegments(trigger: TriggeredMessage, segs: MessageSegment[], turn?: ReplyTurn): Promise<void> {
+  if (turn && !turn.isCurrent()) return;
+  const entertainment = turn?.entertainment ?? (trigger.kind === "group" && modes.isEntertainment(trigger.groupId!));
   if (trigger.kind === "private") {
     await client.sendMessage({ message_type: "private", user_id: trigger.userId, message: segs });
   } else if (trigger.groupId) {
@@ -1042,7 +1138,7 @@ async function sendSegments(trigger: TriggeredMessage, segs: MessageSegment[]): 
         return "[" + s.type + "]";
       })
       .join("");
-    if (content.trim()) writeChatLine(trigger.groupId, config.bot.selfId, config.bot.nickname, content);
+    if (content.trim()) writeChatLine(trigger.groupId, config.bot.selfId, config.bot.nickname, content, entertainment);
     // 影子门控：记下机器人自己刚说过话（时间 + 发言者）
     groupLastBotAt.set(trigger.groupId, Date.now());
     // 娱乐模式：把这次发言计进近期窗口，供主动门控参考
@@ -1094,6 +1190,14 @@ const attachments = createAttachments({
   maxTextChars: config.files?.maxTextChars,
   maxTotalChars: config.files?.maxTotalChars,
   pdftotext: config.files?.pdftotext,
+});
+const mediaContext = new MediaContext({
+  attachments, runner, log,
+  model: () => {
+    const selected = config.entertainment?.media?.model;
+    return selected ? modelRegistry[selected] ?? selected : modelRegistry[currentModel];
+  },
+  sanitize: text => redactSensitive(text),
 });
 
 // ── 长期记忆：按相关性注入（控 token）+ 超量自动合并（控条数）──
@@ -1318,6 +1422,8 @@ async function flushBridgeOut(): Promise<void> {
 }
 
 log("[main] pi-napcatqq bot 启动，白名单:", [...whitelist].join(", "));
+log(`[media] 娱乐群图片理解${config.entertainment?.media?.enabled === false ? "关闭" : "开启"}（仅新消息；每条最多 3 图，后台不主动发言）`);
+log("[modes] v2 模式隔离已启用（切换取消旧任务、双向历史隔离、内部协议防漏）");
 if (config.jw?.className) setClassFilter(config.jw.className);
 setInterval(() => refreshAllRosters().catch(() => {}), 10 * 60_000).unref();
 setInterval(cleanupMemoryArchives, 30 * 60_000).unref();
@@ -1338,7 +1444,9 @@ async function shutdown(): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   taskScheduler.stop();
+  modeTurns.close();
   client.close();
+  await mediaContext.close();
   await runner.close();
   await knowledge?.close();
   process.exit(0);

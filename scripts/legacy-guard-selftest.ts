@@ -16,6 +16,10 @@ const api = { registerTool: (tool: any) => tools.set(tool.name, tool) };
 try {
   const extensionDir = path.join(temp, "sandbox", ".pi", "extensions");
   mkdirSync(extensionDir, { recursive: true });
+  mkdirSync(path.join(temp, "src"));
+  for (const file of ["group-chat.ts", "reply-policy.ts"]) {
+    cpSync(path.join(root, "src", file), path.join(temp, "src", file));
+  }
   for (const name of ["memory-tools.ts", "chat-tools.ts"]) cpSync(path.join(root, "sandbox", ".pi", "extensions", name), path.join(extensionDir, name));
   cpSync(path.join(root, "sandbox", ".pi", "knowledge-guard.ts"), path.join(temp, "sandbox", ".pi", "knowledge-guard.ts"));
   writeFileSync(path.join(temp, "package.json"), JSON.stringify({ type: "module" }));
