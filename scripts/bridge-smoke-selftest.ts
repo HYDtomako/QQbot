@@ -101,6 +101,8 @@ try {
   trace = calls();
   assert.equal(trace.at(-1).hasToken, false);
   assert.ok(!trace.at(-1).tools.includes("memory_search"));
+  // 娱乐模式不接新记忆，但提示词必须带上群聊记录——只 @ 不说话时要靠它接上文
+  assert.match(trace.at(-1).prompt, /\[群里最近的聊天记录/);
   await ask("group", "关闭娱乐模式");
   await ask("group", "关闭记忆");
   await ask("group", "停用后继续问答");

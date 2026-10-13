@@ -166,7 +166,7 @@ async function proactiveSay(gid: string): Promise<void> {
  */
 async function sendEntertainmentReply(gid: string, raw: string, choices: StickerEntry[], label: string, turn: ReplyTurn): Promise<void> {
   if (!turn.entertainment || !turn.isCurrent()) return;
-  const reply = parseEntertainmentReply(raw);
+  const reply = parseEntertainmentReply(raw, choices);
   if (!reply.valid) {
     log(`[ent] 忽略无法解析的回复 -> 群 ${gid}`);
     return;
@@ -219,7 +219,8 @@ async function sendEntertainmentReply(gid: string, raw: string, choices: Sticker
     }
     groupLastBotAt.set(gid, ts);
     stickerLibrary.recordSent(gid, sticker?.id ?? null, ts);
-    const content = [text, sticker ? `[表情包:${sticker.name} (${sticker.id})]` : ""].filter(Boolean).join(" ");
+    // 群聊历史会回喂模型，不能写入素材 ID 或内部协议标注。
+    const content = [text, sticker ? "[表情包]" : ""].filter(Boolean).join(" ");
     writeChatLine(gid, config.bot.selfId, config.bot.nickname, content, true);
     log(`[ent] ${label} -> 群 ${gid}: ${content.slice(0, 80)}`);
   } catch (err) {
@@ -236,7 +237,7 @@ function recentChatContext(gid: string, limit: number, entertainment: boolean): 
       const isBot = e.u === config.bot.selfId;
       const who = isBot ? "(你自己)" : `${e.n || e.u}（QQ ${e.u}）`;
       const description = e.id ? mediaContext.getDescriptions(gid, e.id) : [];
-      const text = renderChatMessage(e, description);
+      const text = renderChatMessage(e, description).replace(/\[表情包:[^\]]*\]/g, "[表情包]");
       const content = isBot ? recordedReplyText(text) : text;
       return content ? `[${e.t}${e.id ? ` 消息 ${e.id}` : ""}] ${who}: ${content}` : "";
     }).filter(Boolean);

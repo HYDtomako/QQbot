@@ -14,6 +14,11 @@ if (compactInput) {
   // PA 回发整理：原文落盘供测试断言，并回一条干净答复（模拟模型已去掉过程细节）
   writeFileSync(path.join(process.cwd(), "last-compact-input.txt"), compactInput[1]);
   console.log("已重启，**现在生效了**，你不用动手。");
-} else if (/旧会话不应进入|普通消息不应进入/.test(prompt)) console.log("BAD: OLD CONTEXT LEAK");
-else if (prompt.includes("合成旧偏好：短句")) console.log("合成回复：私聊旧记忆可用");
+} else if (/旧会话不应进入/.test(prompt)) {
+  console.log("BAD: OLD CONTEXT LEAK");
+} else if (/普通消息不应进入/.test(prompt) && !prompt.includes("[娱乐模式")) {
+  // 娱乐模式的提示词本来就该带群聊记录（主动插话一直如此），"普通消息"出现在其中不算泄漏；
+  // 这条金丝雀守的是正常模式与记忆托管路径，那两条仍然不许出现。
+  console.log("BAD: OLD CONTEXT LEAK");
+} else if (prompt.includes("合成旧偏好：短句")) console.log("合成回复：私聊旧记忆可用");
 else console.log("合成回复：当前问答完成");
