@@ -12,6 +12,9 @@
     "stickers:watch": "node scripts/stickers-watch.ts",
     "selftest:knowledge": "node scripts/knowledge-selftest.ts",
     "selftest:runner": "node scripts/runner-selftest.ts",
+    "selftest:media": "node scripts/message-content-selftest.ts && node scripts/media-context-selftest.ts && node scripts/media-smoke-selftest.ts",
+    "probe:vision": "node scripts/vision-probe.ts",
+    "selftest:modes": "node scripts/reply-policy-selftest.ts && node scripts/mode-switch-selftest.ts",
     "selftest:bridge": "node scripts/bridge-smoke-selftest.ts",
     "selftest:pa-format": "node scripts/pa-format-selftest.ts",
     "selftest:memory": "node scripts/runner-selftest.ts && node scripts/knowledge-selftest.ts && node scripts/knowledge-safety-selftest.ts && node scripts/legacy-guard-selftest.ts && node scripts/knowledge-integration-selftest.ts && node scripts/bridge-smoke-selftest.ts"

@@ -1,3 +1,6 @@
+import { parseMessageContent } from "./message-content.ts";
+export { pickFileName } from "./message-content.ts";
+
 export interface ImageRef {
   /** NapCat 给的本地路径或文件名 */
   file?: string;
@@ -5,6 +8,8 @@ export interface ImageRef {
   fileId?: string;
   /** 图片 CDN 链接 */
   url?: string;
+  summary?: string;
+  isSticker?: boolean;
 }
 
 export interface FileRef {
@@ -38,20 +43,6 @@ export interface TriggeredMessage {
 }
 
 /**
- * 取"文件"段里的原始文件名。NapCat 的字段名不统一：
- * 实时消息与 get_msg 历史消息里常用 `file` 放文件名，部分版本用 `file_name` / `name`。
- * `file` 也可能是带目录的本地路径，故只取末段。
- */
-export function pickFileName(data: Record<string, unknown> | undefined): string | undefined {
-  for (const v of [data?.file_name, data?.name, data?.file]) {
-    if (typeof v !== "string") continue;
-    const name = v.trim().split(/[\\/]/).pop()!.trim();
-    if (name) return name;
-  }
-  return undefined;
-}
-
-/**
  * 判断一条 OneBot 消息事件是否应触发 pi：
  * - 私聊：发送者在白名单内直接触发；
  * - 群聊：消息 @ 了机器人（at 段或文本形式的 @）即触发；
@@ -72,35 +63,9 @@ export function matchMessage(
   // 忽略自己发的消息（防止自触发循环）
   if (userId === selfId) return null;
 
-  let text = "";
-  let mentionedBot = false;
-  const images: ImageRef[] = [];
-  const files: FileRef[] = [];
-  const replyIds: string[] = [];
-  for (const seg of segments) {
-    if (seg.type === "text") {
-      text += String(seg.data?.text ?? "");
-    } else if (seg.type === "at") {
-      if (String(seg.data?.qq ?? "") === selfId) mentionedBot = true;
-    } else if (seg.type === "image") {
-      images.push({
-        file: typeof seg.data?.file === "string" ? seg.data.file : undefined,
-        fileId: typeof seg.data?.file_id === "string" ? seg.data.file_id : undefined,
-        url: typeof seg.data?.url === "string" ? seg.data.url : undefined,
-      });
-    } else if (seg.type === "file") {
-      files.push({
-        fileId: typeof seg.data?.file_id === "string" ? seg.data.file_id : undefined,
-        name: pickFileName(seg.data),
-        url: typeof seg.data?.url === "string" ? seg.data.url : undefined,
-        size: Number(seg.data?.file_size ?? 0) || undefined,
-      });
-    } else if (seg.type === "reply") {
-      const id = seg.data?.id;
-      if (id !== undefined && id !== null && String(id) !== "") replyIds.push(String(id));
-    }
-  }
-  text = text.trim();
+  const content = parseMessageContent(segments, selfId);
+  let { text, mentionedBot } = content;
+  const { images, files, replyIds } = content;
   const hasContent = !!text || images.length > 0 || files.length > 0;
   const eventTime = typeof event.time === "number" ? event.time * 1000 : undefined;
   const source = {

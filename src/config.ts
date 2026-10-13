@@ -63,6 +63,12 @@ export interface BotConfig {
   entertainment?: {
     /** 目标回复频率 0~1，越小越少主动开口，默认 0.3 */
     replyFrequency?: number;
+    media?: {
+      /** 娱乐群来图后台识别，默认开启；仅处理新消息，不回扫历史。 */
+      enabled?: boolean;
+      /** 可选视觉模型别名或 pi 模型规格；不填跟随当前对话模型。 */
+      model?: string;
+    };
   };
   jw?: {
     user: string;

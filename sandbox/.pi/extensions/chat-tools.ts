@@ -27,6 +27,8 @@ import path from "node:path";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { isLegacyProtected } from "../knowledge-guard.ts";
+import { parseChatLog, renderChatMessage } from "../../../src/group-chat.ts";
+import { recordedReplyText } from "../../../src/reply-policy.ts";
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(MODULE_DIR, "../../..");
@@ -88,16 +90,11 @@ export default function chatToolsExtension(pi: ExtensionAPI) {
       const file = path.join(LOG_DIR, `${target}-${dateStr}.jsonl`);
       if (!existsSync(file)) return text(`${dateStr} 群 ${target} 没有聊天记录。`);
 
-      const lines = readFileSync(file, "utf8").split("\n").filter((x) => x.trim());
-      const entries = lines
-        .map((l) => {
-          try {
-            return JSON.parse(l) as { t: string; u: string; n: string; m: string };
-          } catch {
-            return null;
-          }
-        })
-        .filter(Boolean) as Array<{ t: string; u: string; n: string; m: string }>;
+      const entries = parseChatLog(readFileSync(file, "utf8"))
+        .map(entry => {
+          const body = renderChatMessage(entry);
+          return { ...entry, m: entry.u === process.env.QQ_BOT_SELF_ID ? recordedReplyText(body) : body };
+        }).filter(entry => entry.m.trim());
       if (entries.length === 0) return text(`${dateStr} 没有可读的聊天记录。`);
 
       const users = new Map<string, number>();
