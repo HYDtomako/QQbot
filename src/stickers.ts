@@ -132,15 +132,48 @@ export class StickerLibrary {
   }
 }
 
+const SILENCE_RE = /^这次不说了[。.!！]?$/;
+/** 旧格式内部标注：[表情包:名称 (id)]，兼容半角/全角括号与中英文冒号 */
+const ANNOTATION_RE = /[\[［【]\s*表情包\s*[:：]\s*([^\]］】]*)[\]］】]/g;
+/** 标注正文里的 “名称 (id)” 形式（名称可省、可为空） */
+const ANNOTATION_ID_RE = /^(.*?)\s*[（(]\s*([a-z0-9_-]+)\s*[)）]$/i;
+const BARE_ID_RE = /^[a-z0-9_-]+$/i;
+
+/** 取标注正文里的 id：优先 “名称 (id)”，其次整段就是个 id；只有名称时返回 null。 */
+function annotationId(body: string): string | null {
+  const b = body.trim();
+  const m = ANNOTATION_ID_RE.exec(b);
+  if (m) return m[2].toLowerCase();
+  return BARE_ID_RE.test(b) ? b.toLowerCase() : null;
+}
+
+/**
+ * 剥离 text 里的内部标注（旧格式回喂污染的产物），返回纯文本与命中的候选 ID。
+ * 只有 id 命中本轮候选才选图（名称只当提示，不强行选图）；没有标注时原样返回，不做任何清洗。
+ */
+function stripAnnotations(text: string, ids: ReadonlySet<string>): { text: string; sticker: string | null } {
+  let hit: string | null = null;
+  const cleaned = text.replace(ANNOTATION_RE, (_all, body: string) => {
+    const id = annotationId(String(body ?? ""));
+    if (id && !hit && ids.has(id)) hit = id;
+    return "";
+  });
+  if (cleaned === text) return { text, sticker: null };
+  return { text: cleaned.replace(/[ \t]{2,}/g, " ").trim(), sticker: hit };
+}
+
 /**
  * 解析娱乐模式的回复协议：
  *   - 合法 JSON {"text":"…","sticker":"id"|null} → 用协议字段（sticker 是否在候选里由调用方校验）
  *   - 纯文本按老格式兜底（模型没按协议输出时照常发）；“这次不说了” = 沉默
  *   - 看起来是 JSON（含 {）但解析不了 → 整条作废：宁可不发，也不把半截 JSON 发进群
+ *   - 兜底：模型把 “[表情包:名称 (id)]” 这类内部标注写进 text 时一律剥离；
+ *     标注里的 id 命中 candidates 才当选中该图，否则只洗文本、sticker 保持 null，绝不原样发进群
  */
-export function parseEntertainmentReply(raw: string): EntertainmentReply {
+export function parseEntertainmentReply(raw: string, candidates: readonly { id: string }[] = []): EntertainmentReply {
   const t = String(raw ?? "").trim();
-  if (!t || /^这次不说了[。.!！]?$/.test(t)) return { valid: true, text: "", sticker: null };
+  if (!t || SILENCE_RE.test(t)) return { valid: true, text: "", sticker: null };
+  const ids = new Set(candidates.map((c) => c.id));
   if (t.includes("{")) {
     const cleaned = t.replace(/^```[a-zA-Z]*\s*/, "").replace(/\s*```$/, "").trim();
     let obj: unknown;
@@ -151,11 +184,14 @@ export function parseEntertainmentReply(raw: string): EntertainmentReply {
     }
     if (!obj || typeof obj !== "object" || Array.isArray(obj)) return { valid: false, text: "", sticker: null };
     const rec = obj as { text?: unknown; sticker?: unknown };
-    const text = typeof rec.text === "string" ? rec.text : "";
+    const fallback = stripAnnotations(typeof rec.text === "string" ? rec.text : "", ids);
     const sk = typeof rec.sticker === "string" ? rec.sticker.trim() : "";
-    return { valid: true, text, sticker: sk && sk !== "null" ? sk : null };
+    // 协议字段优先；它没给图（null/缺失）时才认标注里的候选 ID
+    return { valid: true, text: fallback.text, sticker: (sk && sk !== "null" ? sk : null) ?? fallback.sticker };
   }
-  return { valid: true, text: t, sticker: null };
+  const fallback = stripAnnotations(t, ids);
+  if (SILENCE_RE.test(fallback.text)) return { valid: true, text: "", sticker: null };
+  return { valid: true, text: fallback.text, sticker: fallback.sticker };
 }
 
 /** 拼给模型的回复协议说明与本轮可选表情包清单。 */
@@ -166,6 +202,8 @@ export function stickerPrompt(choices: StickerEntry[]): string {
   const pick = choices.length ? "sticker 只能为上述 ID 或 null" : "sticker 只能为 null";
   return (
     `\n[回复协议] 本轮只返回一个 JSON 对象：{"text":"要说的话","sticker":null}，不要代码围栏或解释。` +
+    `text 只能是要说的话本身（纯文本）：禁止写 "[表情包:…]"、"表情包:…"、"（表情包）" 之类的内部标注，` +
+    `那是内部协议，发到群里会被当成乱码；选图只走 sticker 字段，绝不把标注写进 text。` +
     `text 是自然、简短的纯文本；${pick}，不能写路径或 URL；只发图时 text 置空；` +
     `图已经把意思表达完整就不要再用文字重复解释，没有贴切的图就不用，别按关键词机械选图；` +
     `决定沉默时返回 {"text":"","sticker":null}。\n${list}`

@@ -153,7 +153,7 @@ async function proactiveSay(gid: string): Promise<void> {
  * 表情包按 ID 校验后发送原文件字节；图片被明确拒绝时回退纯文字；协议解析不了整条放弃。
  */
 async function sendEntertainmentReply(gid: string, raw: string, choices: StickerEntry[], label: string): Promise<void> {
-  const reply = parseEntertainmentReply(raw);
+  const reply = parseEntertainmentReply(raw, choices);
   if (!reply.valid) {
     log(`[ent] 忽略无法解析的回复 -> 群 ${gid}`);
     return;
@@ -204,7 +204,8 @@ async function sendEntertainmentReply(gid: string, raw: string, choices: Sticker
     }
     groupLastBotAt.set(gid, ts);
     stickerLibrary.recordSent(gid, sticker?.id ?? null, ts);
-    const content = [text, sticker ? `[表情包:${sticker.name} (${sticker.id})]` : ""].filter(Boolean).join(" ");
+    // 记录只写人类可读的“发过图”，不写 id 这类内部协议标注：这段会回喂给模型，模型会照着抄
+    const content = [text, sticker ? "[表情包]" : ""].filter(Boolean).join(" ");
     writeChatLine(gid, config.bot.selfId, config.bot.nickname, content);
     log(`[ent] ${label} -> 群 ${gid}: ${content.slice(0, 80)}`);
   } catch (err) {
@@ -225,7 +226,9 @@ function recentChatContext(gid: string, limit: number): string {
         try {
           const o = JSON.parse(l) as { u?: string; n?: string; m?: string };
           const who = o.u === config.bot.selfId ? "(你自己)" : o.n || o.u || "?";
-          return `${who}: ${o.m ?? ""}`;
+          // 历史记录里的旧标注 [表情包:名称 (id)] 是内部协议，回喂会被模型照抄，这里洗成人类可读形式
+          const msg = (o.m ?? "").replace(/\[表情包:[^\]]*\]/g, "[表情包]");
+          return `${who}: ${msg}`;
         } catch {
           return "";
         }
