@@ -15,7 +15,8 @@ const temp = mkdtempSync(path.join(os.tmpdir(), "pi-runner-selftest-"));
 const runners = new Set<PiRunner>();
 let sequence = 0;
 const knowledgeTools = [
-  "web_search", "web_read", "current_time", "memory_search", "memory_get", "memory_save", "memory_correct", "memory_forget",
+  "web_search", "web_read", "current_time", "schedule_query", "model_manage", "mode_manage",
+  "memory_search", "memory_get", "memory_save", "memory_correct", "memory_forget", "memory_manage",
 ];
 
 type Event = { id: string; pid: number; args: string[]; env: Record<string, string>; type: string; time: number };

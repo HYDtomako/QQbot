@@ -40,6 +40,28 @@ async function request(action: string, params: Record<string, unknown>): Promise
   }
 }
 
+async function requestCommand(command: string): Promise<ToolResult> {
+  const endpoint = process.env.QQ_MEMORY_CMD_ENDPOINT ?? "";
+  const token = process.env.QQ_MEMORY_CMD_TOKEN ?? "";
+  if (!/^http:\/\/127\.0\.0\.1:\d{1,5}\/memory-command$/.test(endpoint) || !/^[a-f0-9]{64}$/.test(token)) {
+    return text("本次运行未获得记忆管理权限，操作未执行。");
+  }
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+      body: JSON.stringify({ command }),
+      signal: AbortSignal.timeout(12000),
+      redirect: "error",
+    });
+    const value = await response.json() as { ok?: boolean; text?: string };
+    if (typeof value.text !== "string") return text("记忆服务返回格式异常，操作未确认成功。");
+    return text(value.text, response.ok && value.ok === true);
+  } catch {
+    return text("记忆服务不可用或凭据已失效，操作未确认成功；不要声称已经执行。");
+  }
+}
+
 export default function knowledgeToolsExtension(pi: ExtensionAPI) {
   const fields = {
     query: { type: "string", description: "本次问题的简短检索关键词，不超过 200 字" },
@@ -77,4 +99,26 @@ export default function knowledgeToolsExtension(pi: ExtensionAPI) {
       execute: async (_id, params) => request(tool.action, params),
     });
   }
+
+  pi.registerTool({
+    name: "memory_manage",
+    label: "Memory manage",
+    description: "开启、关闭、查询、退出或恢复当前范围的自动记忆（用户明确要求时使用）。",
+    promptSnippet: "memory_manage: enable/disable/status/opt-out/restore automatic memory",
+    promptGuidelines: [
+      "只在用户明确说出「开启记忆」「关闭记忆」「记忆状态」「退出记忆」「恢复记忆」之一时调用；不要自行发起。",
+      "command 必须原样填这五个词之一，不要改写成别的句子。",
+      "群聊里只有院长可以开启或关闭本群记忆；其他人要求开启/关闭时如实拒绝。退出/恢复只作用于请求者本人。",
+      "工具返回什么就如实转告；操作失败或未获授权时不要声称已经生效。",
+    ],
+    parameters: {
+      type: "object",
+      properties: {
+        command: { type: "string", description: "必须是：开启记忆 / 关闭记忆 / 记忆状态 / 退出记忆 / 恢复记忆" },
+      },
+      required: ["command"],
+      additionalProperties: false,
+    },
+    execute: async (_id, params) => requestCommand(String(params.command ?? "").trim()),
+  });
 }

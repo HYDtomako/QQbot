@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 
 /**
  * 娱乐模式状态：哪些群开了「像麦麦一样主动参与」的娱乐模式。
@@ -22,6 +22,11 @@ export class Modes {
     this.state = this.load();
   }
 
+  /** 重新读取 modes.json（模型通过 mode_manage 工具修改后由桥接热更新）。 */
+  reload(): void {
+    this.state = this.load();
+  }
+
   private load(): ModesState {
     try {
       if (existsSync(this.file)) {
@@ -36,44 +41,11 @@ export class Modes {
     return { entertainment: { groups: [] } };
   }
 
-  private save(): void {
-    writeFileSync(this.file, JSON.stringify(this.state, null, 2) + "\n");
-  }
-
   isEntertainment(groupId: string): boolean {
     return this.state.entertainment.groups.includes(String(groupId));
-  }
-
-  /** 开/关某个群的娱乐模式，返回改动后该群是否处于开启状态。 */
-  setEntertainment(groupId: string, on: boolean): boolean {
-    const g = String(groupId);
-    const set = new Set(this.state.entertainment.groups);
-    if (on) set.add(g);
-    else set.delete(g);
-    this.state.entertainment.groups = [...set];
-    this.save();
-    return on;
   }
 
   listEntertainment(): string[] {
     return [...this.state.entertainment.groups];
   }
-}
-
-/**
- * 识别娱乐模式开关指令（仅院长可用，命中与否由调用方校验身份）。
- * 覆盖常见说法：开启/打开/启动/进入 娱乐模式；关闭/退出/停止/关掉 娱乐模式。
- */
-export function matchModeCommand(text: string): { action: "on" | "off" } | null {
-  const t = text.trim().replace(/[，,。！？!?~～\s]+$/g, "");
-  if (!/娱乐模式|娱乐态/.test(t)) return null;
-  if (/(?:开启|打开|启动|进入|开一下|开来|开起|启用)/.test(t)) return { action: "on" };
-  if (/(?:关闭|关掉|退出|停止|结束|停用|不要)/.test(t)) return { action: "off" };
-  return null;
-}
-
-/** 从指令文本里抽一个群号（私聊里指定目标群时用），没有则返回 null。 */
-export function extractGroupId(text: string): string | null {
-  const m = text.match(/\b(\d{6,12})\b/);
-  return m ? m[1] : null;
 }

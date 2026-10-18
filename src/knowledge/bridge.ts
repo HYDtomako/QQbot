@@ -1,10 +1,6 @@
 import type { TriggeredMessage } from "../router.ts";
 import type { KnowledgeInput, KnowledgeTurn } from "./types.ts";
 
-export function isKnowledgeCommand(text: string): boolean {
-  return ["开启记忆", "关闭记忆", "记忆状态", "退出记忆", "恢复记忆"].includes(text.trim());
-}
-
 export function acceptedKnowledgeInput(trigger: TriggeredMessage, normal: boolean): KnowledgeInput {
   return {
     kind: trigger.kind,
