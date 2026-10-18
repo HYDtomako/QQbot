@@ -88,7 +88,7 @@ try {
   const registered = new Map<string, { execute: (id: string, params: Record<string, unknown>) => Promise<any> }>();
   knowledgeTools({ registerTool: tool => registered.set(tool.name, tool) });
   check("记忆扩展没有自报 QQ 或群号参数", () => {
-    assert.deepEqual([...registered.keys()], ["memory_search", "memory_get", "memory_save", "memory_correct", "memory_forget"]);
+    assert.deepEqual([...registered.keys()], ["memory_search", "memory_get", "memory_save", "memory_correct", "memory_forget", "memory_manage"]);
   });
   const oldEndpoint = process.env.QQ_KNOWLEDGE_ENDPOINT, oldToken = process.env.QQ_KNOWLEDGE_TOKEN;
   try {

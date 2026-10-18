@@ -1,5 +1,7 @@
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { createServer, type ServerResponse } from "node:http";
+import { randomBytes } from "node:crypto";
 import { mkdirSync, writeFileSync, existsSync, readFileSync, statSync, renameSync, readdirSync, unlinkSync, watchFile } from "node:fs";
 import { loadConfig } from "./config.ts";
 import { OneBotClient, type MessageSegment } from "./onebot.ts";
@@ -15,15 +17,15 @@ import { normalReplyText, recordedReplyText } from "./reply-policy.ts";
 import { buildReply, splitForCard, splitText, textSegment, MAX_SEGMENT_LEN } from "./reply.ts";
 import { Antispam } from "./antispam.ts";
 import { TaskScheduler } from "./tasks.ts";
-import { ensureSchedule, answerDay, setClassFilter, readCache, type ScheduleBundle } from "../schedule/zf.ts";
+import { ensureSchedule, setClassFilter } from "../schedule/zf.ts";
 import { prefetchLinks } from "./linktext.ts";
-import { Modes, matchModeCommand, extractGroupId } from "./modes.ts";
+import { Modes } from "./modes.ts";
 import { DynamicReplyGate, estimateReplyProbability } from "./gate.ts";
 import { StickerLibrary, parseEntertainmentReply, stickerPrompt, type StickerEntry } from "./stickers.ts";
 import { KnowledgeService } from "./knowledge/service.ts";
 import type { KnowledgeTurn } from "./knowledge/types.ts";
 import { normalizeKnowledgeConfig } from "./knowledge/policy.ts";
-import { acceptedKnowledgeInput, isKnowledgeCommand, knowledgeContextPrompt } from "./knowledge/bridge.ts"
+import { acceptedKnowledgeInput, knowledgeContextPrompt } from "./knowledge/bridge.ts"
 import { compactPaReply, needsPaCleanup, PA_REPLY_MAX_CHARS } from "./pa-format.ts";
 
 const log = (...args: unknown[]) => console.log(new Date().toISOString(), ...args);
@@ -33,7 +35,8 @@ const root = path.resolve(here, "..");
 const config = loadConfig(path.join(root, "config.json"));
 const whitelist = new Set(config.bot.whitelist);
 const sandboxDir = path.join(root, "sandbox");
-const modes = new Modes(path.join(root, "modes.json"));
+const modesPath = path.join(root, "modes.json");
+const modes = new Modes(modesPath);
 const modeTurns = new ModeTurns(gid => modes.isEntertainment(gid));
 const stickerLibrary = new StickerLibrary(path.join(root, "stickers"));
 
@@ -332,86 +335,104 @@ function legacyToolEnv(): Record<string, string> {
   };
 }
 
-function setCurrentModel(alias: string): void {
-  currentModel = alias;
-  writeFileSync(modelStatePath, JSON.stringify({ alias }, null, 2));
+// ── 记忆管理：模型通过 memory_manage 工具发起，桥接按本次触发绑定身份执行 ──
+const MEMORY_COMMANDS = new Set(["开启记忆", "关闭记忆", "记忆状态", "退出记忆", "恢复记忆"]);
+const memoryCmdTokens = new Map<string, { input: ReturnType<typeof acceptedKnowledgeInput>; expires: number }>();
+let memoryCmdEndpoint = "";
+
+function respondJson(res: ServerResponse, status: number, ok: boolean, text: string): void {
+  if (res.writableEnded || res.destroyed) return;
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+  res.end(JSON.stringify({ ok, text }));
 }
 
-/** 识别模型管理指令（仅院长可用）。宽容覆盖常见自然说法：
- *  切换模型 deepseek-flash / 模型切换成XXX / 帮我换成XXX / 你现在用的什么模型 / 有哪些模型 */
-function matchModelCommand(text: string): { kind: "switch"; alias: string } | { kind: "status" } | null {
-  const t = text
-    .trim()
-    .replace(/[吧呀啊呗嘛呢哦。！？!?~～，,]+$/g, "")
-    .trim();
-  // 查询类：什么/哪个/啥/哪些 + 模型
-  if (/(?:现在|当前)?\s*(?:用的?|使用的是?|是)?\s*(?:什么|哪个|啥|哪些)\s*模型/.test(t)) return { kind: "status" };
-  if (/^(?:当前|现在)?\s*模型\s*(?:列表|状态)?$/.test(t)) return { kind: "status" };
-  if (/模型有哪些/.test(t)) return { kind: "status" };
-  // 去掉礼貌/介词前缀
-  const body = t.replace(/^(?:请|麻烦|帮忙|帮我|给我|能不能|可以|能否|我要|我想|想要|把)+/g, "").trim();
-  // 触发词 + 连接词 + 别名（别名为纯 ASCII 模型名，避免误伤日常对话）
-  const m = body.match(
-    /^(?:\/model|模型切换|切换模型|换模型|改模型|切换为|切换到|切到|换到|切回|换回|改回|回到|改成|改为|换成|改用|换用|模型|切换|换|改|切|用|使用|启用)\s*(?:一下|成|为|到|是|=|：|:)?\s*(?:模型|model)?\s*(?:切换为|切换到|换成|改为|改成|变成|为|成|到)?\s*([a-zA-Z0-9][a-zA-Z0-9._\-\/]*)$/i,
-  );
-  if (m) return { kind: "switch", alias: m[1].toLowerCase() };
-  return null;
+/** 每次进入 pi 运行前发一个短期凭据，绑定当前会话身份；工具只能提交命令，不能伪造范围。 */
+function memoryCmdEnv(trigger: TriggeredMessage, normal: boolean): Record<string, string> {
+  if (!memoryCmdEndpoint) return {};
+  const now = Date.now();
+  for (const [token, entry] of memoryCmdTokens) if (entry.expires <= now) memoryCmdTokens.delete(token);
+  const token = randomBytes(32).toString("hex");
+  memoryCmdTokens.set(token, { input: acceptedKnowledgeInput(trigger, normal), expires: now + 5 * 60_000 });
+  return { QQ_MEMORY_CMD_ENDPOINT: memoryCmdEndpoint, QQ_MEMORY_CMD_TOKEN: token };
 }
 
-/** 把用户输入解析为模型别名：精确别名 > 模型规格匹配 > 前缀匹配。 */
-function resolveModelAlias(arg: string): string | null {
-  if (modelRegistry[arg]) return arg;
-  for (const [alias, spec] of Object.entries(modelRegistry)) {
-    if (spec === arg || spec.endsWith("/" + arg)) return alias;
-  }
-  for (const alias of Object.keys(modelRegistry)) {
-    if (alias.startsWith(arg) || arg.startsWith(alias)) return alias;
-  }
-  return null;
-}
-
-async function handleModelCommand(
-  trigger: TriggeredMessage,
-  cmd: { kind: "switch"; alias: string } | { kind: "status" },
-): Promise<void> {
-  const aliases = Object.keys(modelRegistry);
-  if (cmd.kind === "switch") {
-    const alias = resolveModelAlias(cmd.alias);
-    if (!alias) {
-      await replyText(trigger, `没有「${cmd.alias}」这个模型。可用：${aliases.join("、")}`);
+const memoryCmdServer = createServer(async (req, res) => {
+  try {
+    if (req.method !== "POST" || req.url !== "/memory-command" || req.socket.remoteAddress !== "127.0.0.1") {
+      respondJson(res, 403, false, "仅允许本机命令请求");
       return;
     }
-    setCurrentModel(alias);
-    await replyText(trigger, `已切换到 ${alias}（${modelRegistry[alias]}）`);
-    log(`[model] ${trigger.userId} 切换 -> ${alias}`);
-    return;
+    const auth = req.headers.authorization;
+    const token = typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    const entry = /^[a-f0-9]{64}$/.test(token) ? memoryCmdTokens.get(token) : undefined;
+    if (!entry || entry.expires <= Date.now()) {
+      if (token) memoryCmdTokens.delete(token);
+      respondJson(res, 401, false, "记忆管理凭据已失效，请重新发送请求");
+      return;
+    }
+    if (!req.headers["content-type"]?.startsWith("application/json")) {
+      respondJson(res, 400, false, "需要 JSON");
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    for await (const chunk of req) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += buf.length;
+      if (bytes > 4096) { respondJson(res, 413, false, "请求过长"); return; }
+      chunks.push(buf);
+    }
+    let payload: { command?: unknown };
+    try {
+      payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    } catch {
+      respondJson(res, 400, false, "无效 JSON");
+      return;
+    }
+    const command = typeof payload?.command === "string" ? payload.command.trim() : "";
+    if (!MEMORY_COMMANDS.has(command)) {
+      respondJson(res, 400, false, "未知记忆操作");
+      return;
+    }
+    const input = entry.input;
+    const normalizedSource = input.text.replace(/\s+/g, "");
+    const permitted = new RegExp(
+      `^(?:(?:请|麻烦|帮我|给我|我要|我想|能不能|可以|能否))*${command}[吧呀啊呗嘛呢哦。！？!?~～，,]*$`,
+    ).test(normalizedSource);
+    if (!permitted) {
+      respondJson(res, 403, false, "当前真实消息没有明确要求这个操作，未执行");
+      return;
+    }
+    if (!input.normal) {
+      respondJson(res, 200, false, "娱乐模式不使用这套记忆，请在正常模式下管理。");
+      return;
+    }
+    if (!knowledge) {
+      respondJson(res, 200, false, "自动记忆尚未配置。请设置 knowledge.enabled 和允许的 groups/privateUsers，再重启后在对应范围开启记忆。");
+      return;
+    }
+    const result = await knowledge.handleCommand({ ...input, text: command, addressed: true });
+    respondJson(res, 200, true, result ?? "当前记忆状态不允许这个操作。");
+  } catch (err) {
+    log("[memory-cmd] 处理失败:", err instanceof Error ? err.message : err);
+    respondJson(res, 500, false, "记忆命令处理失败");
   }
-  await replyText(
-    trigger,
-    `当前模型：${currentModel}（${modelRegistry[currentModel]}）\n可用模型：${aliases.join("、")}`,
-  );
-}
+});
 
-/** 娱乐模式开关（仅院长）：群聊作用于本群，私聊可带群号、缺省用默认群。 */
-async function handleModeCommand(trigger: TriggeredMessage, action: "on" | "off"): Promise<void> {
-  const groupId =
-    trigger.kind === "group"
-      ? trigger.groupId ?? null
-      : extractGroupId(trigger.text) ?? config.bot.defaultGroup ?? null;
-  if (!groupId) {
-    await replyText(trigger, "没指定群，也没有默认群，操作没成功。");
-    return;
-  }
-  const on = action === "on";
-  const changed = modes.isEntertainment(groupId) !== on;
-  modes.setEntertainment(groupId, on);
-  if (changed) {
-    modeTurns.invalidate(groupId);
-    entStates.delete(groupId);
-  }
-  if (!on) mediaContext.cancelGroup(groupId);
-  await replyText(trigger, `娱乐模式已${on ? "开启" : "关闭"}：群 ${groupId}。`);
-  log(`[modes] ${trigger.userId} -> 娱乐模式${on ? "开启" : "关闭"} 群 ${groupId}`);
+try {
+  await new Promise<void>((resolve, reject) => {
+    memoryCmdServer.once("error", reject);
+    memoryCmdServer.listen(0, "127.0.0.1", () => {
+      memoryCmdServer.off("error", reject);
+      const addr = memoryCmdServer.address();
+      if (addr && typeof addr === "object") memoryCmdEndpoint = `http://127.0.0.1:${addr.port}/memory-command`;
+      resolve();
+    });
+  });
+  memoryCmdServer.unref();
+  log(`[memory-cmd] 本地命令通道已启动 ${memoryCmdEndpoint}`);
+} catch (err) {
+  log("[memory-cmd] 启动失败（记忆管理工具将不可用）:", err instanceof Error ? err.message : err);
 }
 
 async function replyText(trigger: TriggeredMessage, text: string, turn?: ReplyTurn): Promise<void> {
@@ -420,130 +441,6 @@ async function replyText(trigger: TriggeredMessage, text: string, turn?: ReplyTu
     if (turn && !turn.isCurrent()) return;
     await sendSegments(trigger, segs, turn).catch((err) => log("[send] 失败:", err.message));
   }
-}
-
-// ── 课表（所有人）：自然语言日期 + 整周视图（本周/下周/下下周/第N周）──
-type ScheduleQuery =
-  | { kind: "day"; date: Date }
-  | { kind: "week"; zsOffset?: number; zs?: number }
-  | { kind: "past" };
-
-function matchScheduleCommand(text: string): ScheduleQuery | null {
-  const t = text.trim();
-  if (t.length > 24) return null;
-  if (!/(?:课表|课程表|有什么课|上什么课|几节课|有课吗)/.test(t)) return null;
-  const now = new Date();
-  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const day = (offset: number) => new Date(startOfToday.getTime() + offset * 86400000);
-  // 第N周课表（图片）
-  const zn = t.match(/第\s*(\d{1,2})\s*周(?:的)?(?:课表|课程表)/);
-  if (zn) return { kind: "week", zs: Number(zn[1]) };
-  // 下周X/周X（具体星期，优先于整周匹配，避免"下周三"被当成"下周"）
-  const wd = t.match(/(下?)(?:周|星期)([一二三四五六日天])/);
-  if (wd) {
-    const map: Record<string, number> = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 日: 7, 天: 7 };
-    const target = map[wd[2]];
-    const todayIdx = (now.getDay() - 1 + 7) % 7; // 周一=0
-    let diff = (target - 1 - todayIdx + 7) % 7;
-    if (wd[1]) diff = diff === 0 ? 7 : diff + 7; // 下周X 至少 +7 天
-    return { kind: "day", date: day(diff) };
-  }
-  // 过去的周（上周/前一周）→ 明确不查
-  // 过去的周（上周/前一周）或过去的天（昨天/前天）→ 明确不查
-  if (/(?:上|前)一?(?:个)?周/.test(t) || /昨天|前天|前一天/.test(t)) return { kind: "past" };
-  // 下N周整周视图：下一周/下周课表/下下周课表/下下下一周…
-  const wk = t.match(/(下+)(?:一|个)?周/);
-  if (wk) return { kind: "week", zsOffset: wk[1].length };
-  if (/^课表$/.test(t) || /今天/.test(t)) return { kind: "day", date: day(0) };
-  if (/明天/.test(t)) return { kind: "day", date: day(1) };
-  if (/后天/.test(t)) return { kind: "day", date: day(2) };
-  if (/大后天/.test(t)) return { kind: "day", date: day(3) };
-  const nAfter = t.match(/(\d{1,2})天后/);
-  if (nAfter) return { kind: "day", date: day(Number(nAfter[1])) };
-  const md = t.match(/(\d{1,2})月(\d{1,2})[日号]/);
-  if (md) {
-    let d = new Date(now.getFullYear(), Number(md[1]) - 1, Number(md[2]));
-    if (d < startOfToday) d = new Date(now.getFullYear() + 1, Number(md[1]) - 1, Number(md[2]));
-    return { kind: "day", date: d };
-  }
-  const iso = t.match(/(\d{4})-(\d{1,2})-(\d{1,2})/);
-  if (iso) return { kind: "day", date: new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3])) };
-  if (/本周|这周/.test(t)) return { kind: "week" };
-  return { kind: "day", date: day(0) }; // 光"课表"=今天
-}
-
-async function handleScheduleCommand(trigger: TriggeredMessage, sched: ScheduleQuery): Promise<void> {
-  const jw = config.jw;
-  if (!jw) {
-    await replyText(trigger, "课表功能未配置。");
-    return;
-  }
-  if (sched.kind === "past") {
-    await replyText(trigger, "过去的课表就不查啦，往前看才是硬道理～");
-    return;
-  }
-  if (sched.kind === "week") {
-    let bundle = await ensureSchedule(jw);
-    const zs = sched.zs ?? bundle.currentZs + (sched.zsOffset ?? 0);
-    if (!bundle.weeks[String(zs)]) bundle = await ensureSchedule(jw, [zs]);
-    const lessons = bundle.weeks[String(zs)] ?? [];
-    // 周课表：图片 + 文字说明并存
-    try {
-      const { renderWeekImage } = await import("../schedule/image.ts");
-      const png = renderWeekImage(bundle, zs, jw.periodTimes);
-      await sendSegments(trigger, [{ type: "image", data: { file: "base64://" + png.toString("base64") } }]);
-      await replyText(
-        trigger,
-        `第 ${zs} 周共 ${lessons.length} 节课。要看某一天的详细安排，直接说"周几有什么课"～`,
-      );
-      return;
-    } catch (err) {
-      log("[schedule] 图片渲染失败，回退文本:", err instanceof Error ? err.message : err);
-    }
-    await replyText(trigger, answerWeek(bundle, jw.periodTimes, zs));
-    return;
-  }
-  const now = new Date();
-  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const daysDiff = Math.round((sched.date.getTime() - startOfToday.getTime()) / 86400000);
-  if (daysDiff < 0) {
-    await replyText(trigger, "那天的课查不了啦——已经过去了。");
-    return;
-  }
-  if (daysDiff > 56) {
-    await replyText(trigger, "太久远啦（超过 8 周），最多查两个月内的课表。");
-    return;
-  }
-  const dateLabel = `${sched.date.getMonth() + 1}月${sched.date.getDate()}日`;
-  // 由目标日期推算周次：当前周 + 跨越的整周数
-  const todayIdx = (now.getDay() - 1 + 7) % 7;
-  const estimatedZs = (readCache()?.currentZs ?? 0) + Math.floor((todayIdx + daysDiff) / 7);
-  const wantedZs = estimatedZs > 0 ? [estimatedZs] : [];
-  const bundle = await ensureSchedule(jw, wantedZs);
-  const zs = bundle.currentZs + Math.floor((todayIdx + daysDiff) / 7);
-  const weekday = ((todayIdx + daysDiff) % 7) + 1;
-  await replyText(trigger, answerDay(bundle, weekday, zs, jw.periodTimes, dateLabel));
-}
-
-/** 整周课表（按天分组），支持任意周次。 */
-function answerWeek(cache: ScheduleBundle, periodTimes?: Record<string, string>, zs?: number): string {
-  const week = zs ?? cache.currentZs;
-  const names = ["", "周一", "周二", "周三", "周四", "周五", "周六", "周日"];
-  const parts: string[] = [];
-  for (let d = 1; d <= 7; d++) {
-    const lessons = (cache.weeks[String(week)] ?? [])
-      .filter((l) => l.xqj === d)
-      .sort((a, b) => a.jcStart - b.jcStart);
-    if (lessons.length === 0) continue;
-    const lines = lessons
-      .map((l) => {
-        const start = periodTimes?.[String(l.jcStart)];
-        return `  ${l.jc} ${l.kcmc} @${l.cdmc}${start ? `（${start}）` : ""}`;
-      })
-      .join("\n");
-    parts.push(`${names[d]}：\n${lines}`);
-  }
-  return parts.length ? `第 ${week} 周课表：\n${parts.join("\n")}` : `第 ${week} 周没有查到课程。`;
 }
 
 // ── 输出脱敏：密钥不得出现在发给任何人的消息里（对所有人生效，院长也不例外）──
@@ -672,6 +569,24 @@ watchFile(modelStatePath, { interval: 2000 }, () => {
       currentModel = saved;
       log(`[model] 检测到切换 → ${saved}（${modelRegistry[saved]}）`);
     }
+  } catch {
+    /* 文件半写入状态等下次触发 */
+  }
+});
+
+// 监视 modes.json：pi 的 mode_manage 工具开关娱乐模式后 → 热更新内存状态
+watchFile(modesPath, { interval: 2000 }, () => {
+  try {
+    const before = new Set(modes.listEntertainment());
+    modes.reload();
+    const after = new Set(modes.listEntertainment());
+    for (const gid of new Set([...before, ...after])) {
+      if (before.has(gid) === after.has(gid)) continue;
+      modeTurns.invalidate(gid);
+      entStates.delete(gid);
+      if (!after.has(gid)) mediaContext.cancelGroup(gid);
+    }
+    log(`[modes] 检测到娱乐模式配置变更 → 已开启：${[...after].join("、") || "无"}`);
   } catch {
     /* 文件半写入状态等下次触发 */
   }
@@ -813,35 +728,6 @@ function cleanupChatLogs(): void {
 async function handleTrigger(trigger: TriggeredMessage): Promise<void> {
   log(`[trigger] ${trigger.kind}${trigger.groupId ? `/${trigger.groupId}` : ""} <- ${trigger.userId}: ${trigger.text.slice(0, 80)}`);
 
-  // 模型管理指令：仅院长；命中则不经过 pi，直接回复
-  const cmd = matchModelCommand(trigger.text);
-  if (cmd) {
-    if (trigger.userId !== config.bot.owner) {
-      await replyText(trigger, "只有院长可以查询或切换模型。");
-      return;
-    }
-    await handleModelCommand(trigger, cmd);
-    return;
-  }
-
-  // 娱乐模式开关：仅院长；命中则不经过 pi
-  const modeCmd = matchModeCommand(trigger.text);
-  if (modeCmd) {
-    if (trigger.userId !== config.bot.owner) {
-      await replyText(trigger, "只有院长可以开启或关闭娱乐模式。");
-      return;
-    }
-    await handleModeCommand(trigger, modeCmd.action);
-    return;
-  }
-
-  // 课表指令：对所有人开放（只读查询；背后登录信息受脱敏保护，任何人都无法经此改动任何东西）
-  const sched = matchScheduleCommand(trigger.text);
-  if (sched) {
-    await handleScheduleCommand(trigger, sched);
-    return;
-  }
-
   const turn = modeTurns.begin(trigger.kind === "group" ? trigger.groupId : undefined);
   try {
     await handleReplyTurn(trigger, turn);
@@ -854,15 +740,9 @@ async function handleReplyTurn(trigger: TriggeredMessage, turn: ReplyTurn): Prom
   const normalAtEntry = !turn.entertainment;
   const cancelled: PiResult = { ok: false, text: "模式已切换，本轮已取消", durationMs: 0 };
   const memoryInput = acceptedKnowledgeInput(trigger, normalAtEntry);
-  const memoryCommand = isKnowledgeCommand(trigger.text)
-    ? !normalAtEntry ? "娱乐模式不使用这套记忆，请在正常模式下管理。"
-      : knowledge ? await knowledge.handleCommand(memoryInput)
-      : "自动记忆尚未配置。请设置 knowledge.enabled 和允许的 groups/privateUsers，再重启后在对应范围开启记忆。"
-    : undefined;
-  if (memoryCommand !== undefined) {
-    await replyText(trigger, memoryCommand, turn);
-    return;
-  }
+
+  // 所有正常提问（含模型管理、娱乐模式开关、记忆管理）统一交给 pi 判断，
+  // 由模型按需调用 model_manage / mode_manage 等工具，桥接不再做关键词拦截。
 
   // 同一上下文串行：群聊按群共享会话文件（避免并发写同一文件），私聊按用户
   const runStart = Date.now();
@@ -899,7 +779,7 @@ async function handleReplyTurn(trigger: TriggeredMessage, turn: ReplyTurn): Prom
         });
         if (!turn.isCurrent()) return cancelled;
         result = await runner.run(prompt, {
-          mode: "knowledge", model: modelRegistry[currentModel], env: { ...legacyToolEnv(), ...knowledgeTurn.env },
+          mode: "knowledge", model: modelRegistry[currentModel], env: { ...legacyToolEnv(), ...knowledgeTurn.env, ...memoryCmdEnv(trigger, normalAtEntry) },
           imagePaths: [...imagePaths, ...readyFiles.map((f) => f.path)], signal: turn.signal,
         });
         if (!turn.isCurrent()) result = cancelled;
@@ -924,7 +804,7 @@ async function handleReplyTurn(trigger: TriggeredMessage, turn: ReplyTurn): Prom
     if (!turn.isCurrent()) return cancelled;
     if (legacyPersonalAllowed) maybeMergeMemories(trigger.userId).catch(() => {});
     const result = await runner.run(prompt, {
-      mode: "web", model: modelRegistry[currentModel], sessionFile: session.file, env: legacyToolEnv(),
+      mode: "web", model: modelRegistry[currentModel], sessionFile: session.file, env: { ...legacyToolEnv(), ...memoryCmdEnv(trigger, normalAtEntry) },
       imagePaths: [...imagePaths, ...readyFiles.map((f) => f.path)], signal: turn.signal,
     });
     if (trigger.kind === "group" && normalAtEntry && turn.isCurrent() && result.ok

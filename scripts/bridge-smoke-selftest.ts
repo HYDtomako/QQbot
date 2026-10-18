@@ -48,6 +48,9 @@ function calls(): any[] {
   const file = path.join(temp, "sandbox", "fixture-calls.jsonl");
   return existsSync(file) ? readFileSync(file, "utf8").trim().split("\n").filter(Boolean).map(x => JSON.parse(x)) : [];
 }
+function logCount(fragment: string): number {
+  return output.split(fragment).length - 1;
+}
 async function ask(kind: "group" | "private", text: string) {
   const before = sent.length;
   emit(kind, text);
@@ -80,13 +83,15 @@ try {
   emit("group", "普通消息不应进入", false);
   await ask("group", "我正在学习 Python");
   let trace = calls();
-  assert.equal(trace.length, 1);
-  assert.ok(trace[0].tools.includes("memory_search"));
-  assert.equal(trace[0].hasToken, true);
-  assert.equal(trace[0].session, false);
-  assert.ok(trace[0].protectedGroups.includes(group));
-  assert.ok(trace[0].protectedUsers.includes(owner));
-  assert.doesNotMatch(trace[0].prompt, /旧会话不应进入|普通消息不应进入|合成旧偏好/);
+  assert.equal(trace.length, 3);
+  const normalCall = trace.find(c => c.prompt.includes("我正在学习 Python"));
+  assert.ok(normalCall, "normal @ message should reach pi");
+  assert.ok(normalCall.tools.includes("memory_search"));
+  assert.equal(normalCall.hasToken, true);
+  assert.equal(normalCall.session, false);
+  assert.ok(normalCall.protectedGroups.includes(group));
+  assert.ok(normalCall.protectedUsers.includes(owner));
+  assert.doesNotMatch(normalCall.prompt, /旧会话不应进入|普通消息不应进入|合成旧偏好/);
   console.log("PASS actual main: normal @ uses scoped context, no legacy session or ordinary chat");
 
   await ask("private", "我的回答习惯是什么？");
@@ -96,14 +101,19 @@ try {
   assert.equal(readFileSync(path.join(temp, "memory", "long-term", `${owner}.jsonl`), "utf8"), JSON.stringify({ id: "old", t: "2026-01-01", text: "合成旧偏好：短句" }) + "\n");
   console.log("PASS actual main: private legacy memory is read without changing its file");
 
+  const modesLog = "[modes] 检测到娱乐模式配置变更";
+  let modesSeen = logCount(modesLog);
   await ask("group", "开启娱乐模式");
+  await waitFor(() => logCount(modesLog) > modesSeen, "娱乐模式开启热更新");
   await ask("group", "我喜欢另一种学习路线");
   trace = calls();
   assert.equal(trace.at(-1).hasToken, false);
   assert.ok(!trace.at(-1).tools.includes("memory_search"));
   // 娱乐模式不接新记忆，但提示词必须带上群聊记录——只 @ 不说话时要靠它接上文
   assert.match(trace.at(-1).prompt, /\[群里最近的聊天记录/);
+  modesSeen = logCount(modesLog);
   await ask("group", "关闭娱乐模式");
+  await waitFor(() => logCount(modesLog) > modesSeen, "娱乐模式关闭热更新");
   await ask("group", "关闭记忆");
   await ask("group", "停用后继续问答");
   trace = calls();
@@ -120,11 +130,14 @@ try {
     JSON.stringify({ t: new Date().toISOString(), type: "private", id: owner, text: longReport }) + "\n" +
     JSON.stringify({ t: new Date().toISOString(), type: "private", id: owner, text: shortReply }) + "\n");
   const privateSends = () => sent.filter(s => s.action === "send_msg" && s.params.message_type === "private");
-  await waitFor(() => privateSends().length >= 2, "bridge outbox forwarded");
-  await new Promise(resolve => setTimeout(resolve, 1500)); // 等两条回发都处理完
-  const forwarded = privateSends()
+  const forwardedTexts = () => privateSends()
     .flatMap(s => s.params.message.map((seg: any) => String(seg.data?.text ?? "")))
     .map(t => t.trim());
+  await waitFor(() => {
+    const texts = forwardedTexts();
+    return texts.includes(shortReply) && texts.some(t => t.includes("已重启"));
+  }, "bridge outbox forwarded");
+  const forwarded = forwardedTexts();
   assert.ok(!forwarded.includes(longReport.trim()), "long PA report must not be forwarded verbatim");
   assert.ok(forwarded.includes(shortReply), "short PA reply must pass through unchanged");
   const compacted = forwarded.find(t => t.includes("已重启"));
