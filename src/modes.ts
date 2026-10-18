@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 
 /**
  * 娱乐模式状态：哪些群开了「像麦麦一样主动参与」的娱乐模式。
@@ -22,9 +22,13 @@ export class Modes {
     this.state = this.load();
   }
 
-  /** 重新读取 modes.json（模型通过 mode_manage 工具修改后由桥接热更新）。 */
+  /** 外部修改 modes.json 时热更新；mode_manage 的桥接通道会直接改内存并落盘。 */
   reload(): void {
     this.state = this.load();
+  }
+
+  private save(): void {
+    writeFileSync(this.file, JSON.stringify(this.state, null, 2) + "\n");
   }
 
   private load(): ModesState {
@@ -43,6 +47,17 @@ export class Modes {
 
   isEntertainment(groupId: string): boolean {
     return this.state.entertainment.groups.includes(String(groupId));
+  }
+
+  /** 开/关某个群的娱乐模式；先改内存再落盘，桥接后续判断立即生效。 */
+  setEntertainment(groupId: string, on: boolean): boolean {
+    const g = String(groupId);
+    const set = new Set(this.state.entertainment.groups);
+    if (on) set.add(g);
+    else set.delete(g);
+    this.state.entertainment.groups = [...set];
+    this.save();
+    return on;
   }
 
   listEntertainment(): string[] {

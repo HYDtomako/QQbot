@@ -48,9 +48,6 @@ function calls(): any[] {
   const file = path.join(temp, "sandbox", "fixture-calls.jsonl");
   return existsSync(file) ? readFileSync(file, "utf8").trim().split("\n").filter(Boolean).map(x => JSON.parse(x)) : [];
 }
-function logCount(fragment: string): number {
-  return output.split(fragment).length - 1;
-}
 async function ask(kind: "group" | "private", text: string) {
   const before = sent.length;
   emit(kind, text);
@@ -101,19 +98,16 @@ try {
   assert.equal(readFileSync(path.join(temp, "memory", "long-term", `${owner}.jsonl`), "utf8"), JSON.stringify({ id: "old", t: "2026-01-01", text: "合成旧偏好：短句" }) + "\n");
   console.log("PASS actual main: private legacy memory is read without changing its file");
 
-  const modesLog = "[modes] 检测到娱乐模式配置变更";
-  let modesSeen = logCount(modesLog);
   await ask("group", "开启娱乐模式");
-  await waitFor(() => logCount(modesLog) > modesSeen, "娱乐模式开启热更新");
+  assert.ok(sent.some(s => JSON.stringify(s).includes("娱乐模式已开启")), "mode open acknowledgement must be sent");
   await ask("group", "我喜欢另一种学习路线");
   trace = calls();
   assert.equal(trace.at(-1).hasToken, false);
   assert.ok(!trace.at(-1).tools.includes("memory_search"));
   // 娱乐模式不接新记忆，但提示词必须带上群聊记录——只 @ 不说话时要靠它接上文
   assert.match(trace.at(-1).prompt, /\[群里最近的聊天记录/);
-  modesSeen = logCount(modesLog);
   await ask("group", "关闭娱乐模式");
-  await waitFor(() => logCount(modesLog) > modesSeen, "娱乐模式关闭热更新");
+  assert.ok(sent.some(s => JSON.stringify(s).includes("娱乐模式已关闭")), "mode close acknowledgement must be sent");
   await ask("group", "关闭记忆");
   await ask("group", "停用后继续问答");
   trace = calls();

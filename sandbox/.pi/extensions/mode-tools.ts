@@ -25,13 +25,12 @@ interface ToolResult {
 }
 
 import path from "node:path";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(MODULE_DIR, "../../..");
 const CONFIG_PATH = path.join(ROOT_DIR, "config.json");
-const MODES_PATH = path.join(ROOT_DIR, "modes.json");
 
 const SCHEMA = {
   type: "object",
@@ -71,39 +70,33 @@ export default function modeToolsExtension(pi: ExtensionAPI) {
     ],
     parameters: SCHEMA,
     async execute(_id, params) {
-      const cfg = readJson<{ bot?: { owner?: string; defaultGroup?: string } }>(CONFIG_PATH);
+      const cfg = readJson<{ bot?: { owner?: string } }>(CONFIG_PATH);
       const owner = String(cfg?.bot?.owner ?? "");
       const asker = String(params.asker_qq ?? "").trim();
       if (!asker || asker !== owner) return text("只有院长可以管理娱乐模式。");
 
-      const raw = readJson<Record<string, unknown> & { entertainment?: { groups?: unknown } }>(MODES_PATH) ?? {};
-      const rawGroups = raw.entertainment?.groups;
-      const groups = Array.isArray(rawGroups) ? rawGroups.map(String) : [];
       const op = String(params.op ?? "").trim();
-
-      if (op === "status") {
-        return text(groups.length ? `已开启娱乐模式的群：${groups.join("、")}` : "目前没有开启娱乐模式的群。");
+      if (op !== "status" && op !== "on" && op !== "off") return text("未知操作，应为 status / on / off。");
+      const endpoint = process.env.QQ_MODE_CMD_ENDPOINT ?? "";
+      const token = process.env.QQ_MODE_CMD_TOKEN ?? "";
+      if (!/^http:\/\/127\.0\.0\.1:\d{1,5}\/mode-command$/.test(endpoint) || !/^[a-f0-9]{64}$/.test(token)) {
+        return text("本次运行未获得模式管理权限，操作未执行。");
       }
-      if (op !== "on" && op !== "off") return text("未知操作，应为 status / on / off。");
-
-      const groupId = String(params.group_id ?? "").trim() || String(cfg?.bot?.defaultGroup ?? "").trim();
-      if (!groupId) return text("没指定群号，配置里也没有默认群。");
-      if (!/^\d{5,12}$/.test(groupId)) return text("群号格式不对，请用纯数字群号。");
-
-      const set = new Set(groups);
-      const on = op === "on";
-      if (on) set.add(groupId);
-      else set.delete(groupId);
-
-      const next = {
-        ...raw,
-        entertainment: {
-          ...(raw.entertainment ?? {}),
-          groups: [...set],
-        },
-      };
-      writeFileSync(MODES_PATH, JSON.stringify(next, null, 2) + "\n");
-      return text(`娱乐模式已${on ? "开启" : "关闭"}：群 ${groupId}。`);
+      const groupId = String(params.group_id ?? "").trim();
+      try {
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+          body: JSON.stringify({ op, ...(groupId ? { group_id: groupId } : {}) }),
+          signal: AbortSignal.timeout(12000),
+          redirect: "error",
+        });
+        const value = await response.json() as { ok?: boolean; text?: string };
+        if (typeof value.text !== "string") return text("模式服务返回格式异常，操作未确认成功。");
+        return text(value.text);
+      } catch {
+        return text("模式服务不可用或凭据已失效，操作未确认成功；不要声称已经切换。");
+      }
     },
   });
 }

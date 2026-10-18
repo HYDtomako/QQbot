@@ -1,4 +1,4 @@
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 const args = process.argv.slice(2);
@@ -38,25 +38,21 @@ if (compactInput) {
       console.log("记忆命令通道不可用");
     }
   } else if (/开启娱乐模式|关闭娱乐模式/.test(commandText)) {
-    // 模拟模型调用 mode_manage：直接改 modes.json，桥接应热更新
+    // 模拟模型调用 mode_manage：通过桥接通道切换，桥接应同步更新并放行本轮确认回复
     const on = commandText.includes("开启娱乐模式");
-    const root = path.join(process.cwd(), "..");
-    let raw = {};
-    try { raw = JSON.parse(readFileSync(path.join(root, "modes.json"), "utf8")); } catch { /* 首次创建 */ }
-    let groupId = "45678";
+    const endpoint = process.env.QQ_MODE_CMD_ENDPOINT ?? "";
+    const token = process.env.QQ_MODE_CMD_TOKEN ?? "";
     try {
-      const cfg = JSON.parse(readFileSync(path.join(root, "config.json"), "utf8"));
-      groupId = String(cfg.bot?.defaultGroup ?? groupId);
-    } catch { /* 用测试默认群 */ }
-    const mentioned = prompt.match(/群号\s*(\d{5,12})/);
-    if (mentioned) groupId = mentioned[1];
-    const current = raw?.entertainment?.groups;
-    const groups = new Set(Array.isArray(current) ? current.map(String) : []);
-    if (on) groups.add(groupId);
-    else groups.delete(groupId);
-    raw.entertainment = { ...(raw.entertainment ?? {}), groups: [...groups] };
-    writeFileSync(path.join(root, "modes.json"), JSON.stringify(raw, null, 2) + "\n");
-    console.log(`娱乐模式已${on ? "开启" : "关闭"}：群 ${groupId}。`);
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        body: JSON.stringify({ op: on ? "on" : "off" }),
+      });
+      const value = await response.json();
+      console.log(typeof value.text === "string" ? value.text : "模式命令未返回结果");
+    } catch {
+      console.log("模式命令通道不可用");
+    }
   } else if (/旧会话不应进入/.test(prompt)) {
     console.log("BAD: OLD CONTEXT LEAK");
   } else if (/普通消息不应进入/.test(prompt) && !prompt.includes("[娱乐模式")) {

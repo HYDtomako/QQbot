@@ -338,7 +338,9 @@ function legacyToolEnv(): Record<string, string> {
 // ── 记忆管理：模型通过 memory_manage 工具发起，桥接按本次触发绑定身份执行 ──
 const MEMORY_COMMANDS = new Set(["开启记忆", "关闭记忆", "记忆状态", "退出记忆", "恢复记忆"]);
 const memoryCmdTokens = new Map<string, { input: ReturnType<typeof acceptedKnowledgeInput>; expires: number }>();
+const modeCmdTokens = new Map<string, { input: ReturnType<typeof acceptedKnowledgeInput>; turn: ReplyTurn; expires: number }>();
 let memoryCmdEndpoint = "";
+let modeCmdEndpoint = "";
 
 function respondJson(res: ServerResponse, status: number, ok: boolean, text: string): void {
   if (res.writableEnded || res.destroyed) return;
@@ -356,18 +358,35 @@ function memoryCmdEnv(trigger: TriggeredMessage, normal: boolean): Record<string
   return { QQ_MEMORY_CMD_ENDPOINT: memoryCmdEndpoint, QQ_MEMORY_CMD_TOKEN: token };
 }
 
+/** 模式切换绑定到当前回合：切换后由桥接放行这一轮的确认回复。 */
+function modeCmdEnv(trigger: TriggeredMessage, normal: boolean, turn: ReplyTurn): Record<string, string> {
+  if (!modeCmdEndpoint) return {};
+  const now = Date.now();
+  for (const [token, entry] of modeCmdTokens) if (entry.expires <= now) modeCmdTokens.delete(token);
+  const token = randomBytes(32).toString("hex");
+  modeCmdTokens.set(token, { input: acceptedKnowledgeInput(trigger, normal), turn, expires: now + 5 * 60_000 });
+  return { QQ_MODE_CMD_ENDPOINT: modeCmdEndpoint, QQ_MODE_CMD_TOKEN: token };
+}
+
 const memoryCmdServer = createServer(async (req, res) => {
   try {
-    if (req.method !== "POST" || req.url !== "/memory-command" || req.socket.remoteAddress !== "127.0.0.1") {
+    const isMode = req.url === "/mode-command";
+    const isMemory = req.url === "/memory-command";
+    if (req.method !== "POST" || (!isMode && !isMemory) || req.socket.remoteAddress !== "127.0.0.1") {
       respondJson(res, 403, false, "仅允许本机命令请求");
       return;
     }
     const auth = req.headers.authorization;
     const token = typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : "";
-    const entry = /^[a-f0-9]{64}$/.test(token) ? memoryCmdTokens.get(token) : undefined;
+    const entry = /^[a-f0-9]{64}$/.test(token)
+      ? (isMode ? modeCmdTokens.get(token) : memoryCmdTokens.get(token))
+      : undefined;
     if (!entry || entry.expires <= Date.now()) {
-      if (token) memoryCmdTokens.delete(token);
-      respondJson(res, 401, false, "记忆管理凭据已失效，请重新发送请求");
+      if (token) {
+        if (isMode) modeCmdTokens.delete(token);
+        else memoryCmdTokens.delete(token);
+      }
+      respondJson(res, 401, false, "命令凭据已失效，请重新发送请求");
       return;
     }
     if (!req.headers["content-type"]?.startsWith("application/json")) {
@@ -382,19 +401,58 @@ const memoryCmdServer = createServer(async (req, res) => {
       if (bytes > 4096) { respondJson(res, 413, false, "请求过长"); return; }
       chunks.push(buf);
     }
-    let payload: { command?: unknown };
+    let payload: Record<string, unknown>;
     try {
-      payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      payload = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
     } catch {
       respondJson(res, 400, false, "无效 JSON");
       return;
     }
-    const command = typeof payload?.command === "string" ? payload.command.trim() : "";
+
+    if (isMode) {
+      const modeEntry = entry as { input: ReturnType<typeof acceptedKnowledgeInput>; turn: ReplyTurn; expires: number };
+      const input = modeEntry.input;
+      if (input.userId !== config.bot.owner) {
+        respondJson(res, 403, false, "只有院长可以管理娱乐模式。");
+        return;
+      }
+      const op = typeof payload.op === "string" ? payload.op.trim() : "";
+      if (op === "status") {
+        const groups = modes.listEntertainment();
+        respondJson(res, 200, true, groups.length ? `已开启娱乐模式的群：${groups.join("、")}` : "目前没有开启娱乐模式的群。");
+        return;
+      }
+      if (op !== "on" && op !== "off") {
+        respondJson(res, 400, false, "未知操作，应为 status / on / off。");
+        return;
+      }
+      const groupId = input.kind === "group"
+        ? String(input.groupId ?? "")
+        : String(payload.group_id ?? config.bot.defaultGroup ?? "").trim();
+      if (!/^\d{5,12}$/.test(groupId)) {
+        respondJson(res, 400, false, "群号格式不对，请用纯数字群号。");
+        return;
+      }
+      const on = op === "on";
+      if (modes.isEntertainment(groupId) !== on) {
+        // 保留发起切换的这一轮，让它的确认回复能发出去；同群其他旧回合照旧取消。
+        modeEntry.turn.allowModeChange();
+        modes.setEntertainment(groupId, on);
+        modeTurns.invalidate(groupId, modeEntry.turn);
+        entStates.delete(groupId);
+        if (!on) mediaContext.cancelGroup(groupId);
+      }
+      respondJson(res, 200, true, `娱乐模式已${on ? "开启" : "关闭"}：群 ${groupId}。`);
+      return;
+    }
+
+    const memoryEntry = entry as { input: ReturnType<typeof acceptedKnowledgeInput>; expires: number };
+    const command = typeof payload.command === "string" ? payload.command.trim() : "";
     if (!MEMORY_COMMANDS.has(command)) {
       respondJson(res, 400, false, "未知记忆操作");
       return;
     }
-    const input = entry.input;
+    const input = memoryEntry.input;
     const normalizedSource = input.text.replace(/\s+/g, "");
     const permitted = new RegExp(
       `^(?:(?:请|麻烦|帮我|给我|我要|我想|能不能|可以|能否))*${command}[吧呀啊呗嘛呢哦。！？!?~～，,]*$`,
@@ -414,8 +472,8 @@ const memoryCmdServer = createServer(async (req, res) => {
     const result = await knowledge.handleCommand({ ...input, text: command, addressed: true });
     respondJson(res, 200, true, result ?? "当前记忆状态不允许这个操作。");
   } catch (err) {
-    log("[memory-cmd] 处理失败:", err instanceof Error ? err.message : err);
-    respondJson(res, 500, false, "记忆命令处理失败");
+    log("[local-cmd] 处理失败:", err instanceof Error ? err.message : err);
+    respondJson(res, 500, false, "命令处理失败");
   }
 });
 
@@ -425,14 +483,18 @@ try {
     memoryCmdServer.listen(0, "127.0.0.1", () => {
       memoryCmdServer.off("error", reject);
       const addr = memoryCmdServer.address();
-      if (addr && typeof addr === "object") memoryCmdEndpoint = `http://127.0.0.1:${addr.port}/memory-command`;
+      if (addr && typeof addr === "object") {
+        const base = `http://127.0.0.1:${addr.port}`;
+        memoryCmdEndpoint = `${base}/memory-command`;
+        modeCmdEndpoint = `${base}/mode-command`;
+      }
       resolve();
     });
   });
   memoryCmdServer.unref();
-  log(`[memory-cmd] 本地命令通道已启动 ${memoryCmdEndpoint}`);
+  log(`[local-cmd] 命令通道已启动 ${memoryCmdEndpoint} / ${modeCmdEndpoint}`);
 } catch (err) {
-  log("[memory-cmd] 启动失败（记忆管理工具将不可用）:", err instanceof Error ? err.message : err);
+  log("[local-cmd] 启动失败（记忆/模式管理工具将不可用）:", err instanceof Error ? err.message : err);
 }
 
 async function replyText(trigger: TriggeredMessage, text: string, turn?: ReplyTurn): Promise<void> {
@@ -582,6 +644,8 @@ watchFile(modesPath, { interval: 2000 }, () => {
     const after = new Set(modes.listEntertainment());
     for (const gid of new Set([...before, ...after])) {
       if (before.has(gid) === after.has(gid)) continue;
+      // 外部直接改 modes.json：没有绑定回合，按旧行为取消该群进行中的回合。
+      // mode_manage 工具走桥接通道，会直接改内存并放行发起切换的当前回合。
       modeTurns.invalidate(gid);
       entStates.delete(gid);
       if (!after.has(gid)) mediaContext.cancelGroup(gid);
@@ -779,11 +843,11 @@ async function handleReplyTurn(trigger: TriggeredMessage, turn: ReplyTurn): Prom
         });
         if (!turn.isCurrent()) return cancelled;
         result = await runner.run(prompt, {
-          mode: "knowledge", model: modelRegistry[currentModel], env: { ...legacyToolEnv(), ...knowledgeTurn.env, ...memoryCmdEnv(trigger, normalAtEntry) },
+          mode: "knowledge", model: modelRegistry[currentModel], env: { ...legacyToolEnv(), ...knowledgeTurn.env, ...memoryCmdEnv(trigger, normalAtEntry), ...modeCmdEnv(trigger, normalAtEntry, turn) },
           imagePaths: [...imagePaths, ...readyFiles.map((f) => f.path)], signal: turn.signal,
         });
         if (!turn.isCurrent()) result = cancelled;
-        if (!knowledge.isTurnCurrent(knowledgeTurn)) {
+        if (!knowledge.isTurnCurrent(knowledgeTurn) && !turn.modeChangeAllowed()) {
           result = { ok: false, text: "本次记忆权限或资料已撤销，已停止使用旧上下文，请重新提问。", durationMs: result.durationMs };
         }
         return result;
@@ -804,7 +868,7 @@ async function handleReplyTurn(trigger: TriggeredMessage, turn: ReplyTurn): Prom
     if (!turn.isCurrent()) return cancelled;
     if (legacyPersonalAllowed) maybeMergeMemories(trigger.userId).catch(() => {});
     const result = await runner.run(prompt, {
-      mode: "web", model: modelRegistry[currentModel], sessionFile: session.file, env: { ...legacyToolEnv(), ...memoryCmdEnv(trigger, normalAtEntry) },
+      mode: "web", model: modelRegistry[currentModel], sessionFile: session.file, env: { ...legacyToolEnv(), ...memoryCmdEnv(trigger, normalAtEntry), ...modeCmdEnv(trigger, normalAtEntry, turn) },
       imagePaths: [...imagePaths, ...readyFiles.map((f) => f.path)], signal: turn.signal,
     });
     if (trigger.kind === "group" && normalAtEntry && turn.isCurrent() && result.ok
