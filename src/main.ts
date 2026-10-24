@@ -1,7 +1,5 @@
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { createServer, type ServerResponse } from "node:http";
-import { randomBytes } from "node:crypto";
 import { mkdirSync, writeFileSync, existsSync, readFileSync, statSync, renameSync, readdirSync, unlinkSync, watchFile } from "node:fs";
 import { loadConfig } from "./config.ts";
 import { OneBotClient, type MessageSegment } from "./onebot.ts";
@@ -22,10 +20,6 @@ import { prefetchLinks } from "./linktext.ts";
 import { Modes } from "./modes.ts";
 import { DynamicReplyGate, estimateReplyProbability } from "./gate.ts";
 import { StickerLibrary, parseEntertainmentReply, stickerPrompt, type StickerEntry } from "./stickers.ts";
-import { KnowledgeService } from "./knowledge/service.ts";
-import type { KnowledgeTurn } from "./knowledge/types.ts";
-import { normalizeKnowledgeConfig } from "./knowledge/policy.ts";
-import { acceptedKnowledgeInput, knowledgeContextPrompt } from "./knowledge/bridge.ts"
 import { compactPaReply, needsPaCleanup, PA_REPLY_MAX_CHARS } from "./pa-format.ts";
 
 const log = (...args: unknown[]) => console.log(new Date().toISOString(), ...args);
@@ -152,7 +146,7 @@ async function proactiveSay(gid: string): Promise<void> {
       `- 没有合适的话、你刚说过，或别人正在聊他们自己的事时，可以沉默。\n` +
       stickerPrompt(choices) +
       `\n${MEDIA_CONTEXT_RULES}\n最近消息：\n${ctx}`;
-    const result = await runner.run(prompt, { mode: "web", model: modelRegistry[currentModel], env: legacyToolEnv(), signal: turn.signal });
+    const result = await runner.run(prompt, { mode: "web", model: modelRegistry[currentModel], env: botEnv(), signal: turn.signal });
     if (!result.ok || !turn.isCurrent()) return;
     await sendEntertainmentReply(gid, result.text ?? "", choices, "主动插话", turn);
   } catch (err) {
@@ -303,136 +297,8 @@ function loadCurrentModel(): string {
 
 let currentModel = loadCurrentModel();
 
-const knowledgePath = path.join(root, "memory", "knowledge.sqlite");
-const knowledge = config.knowledge !== undefined || existsSync(knowledgePath)
-  ? new KnowledgeService({
-      dbPath: knowledgePath,
-      legacyDir: path.join(root, "memory", "long-term"),
-      config: normalizeKnowledgeConfig(config.knowledge, config.bot.whitelist),
-      ownerId: config.bot.owner,
-      whitelist: config.bot.whitelist,
-      isNormal: (scope) => !scope.startsWith("group:") || !modes.isEntertainment(scope.slice(6)),
-      runModel: (prompt, signal) => runner.run(prompt, {
-        mode: "none", model: modelRegistry[currentModel], priority: "background", timeoutMs: 60000, signal,
-      }),
-      log,
-    })
-  : undefined;
-if (knowledge) await knowledge.start();
-
-function legacyToolEnv(): Record<string, string> {
-  const rows = knowledge?.store.db.prepare("SELECT scope FROM scope_policies WHERE ever_enabled=1").all() as { scope: string }[] | undefined;
-  return {
-    QQ_BOT_SELF_ID: config.bot.selfId,
-    QQ_KNOWLEDGE_PROTECTED_GROUPS: JSON.stringify([...new Set([
-      ...(config.knowledge?.enabled ? config.knowledge.groups ?? [] : []),
-      ...(rows ?? []).filter(r => r.scope.startsWith("group:")).map(r => r.scope.slice(6)),
-    ])]),
-    QQ_KNOWLEDGE_PROTECTED_USERS: JSON.stringify([...new Set([
-      ...(config.knowledge?.enabled ? config.knowledge.privateUsers ?? [] : []),
-      ...(rows ?? []).filter(r => r.scope.startsWith("private:")).map(r => r.scope.slice(8)),
-    ])]),
-  };
-}
-
-// ── 记忆管理：模型通过 memory_manage 工具发起，桥接按本次触发绑定身份执行 ──
-const MEMORY_COMMANDS = new Set(["开启记忆", "关闭记忆", "记忆状态", "退出记忆", "恢复记忆"]);
-const memoryCmdTokens = new Map<string, { input: ReturnType<typeof acceptedKnowledgeInput>; expires: number }>();
-let memoryCmdEndpoint = "";
-
-function respondJson(res: ServerResponse, status: number, ok: boolean, text: string): void {
-  if (res.writableEnded || res.destroyed) return;
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-  res.end(JSON.stringify({ ok, text }));
-}
-
-/** 每次进入 pi 运行前发一个短期凭据，绑定当前会话身份；工具只能提交命令，不能伪造范围。 */
-function memoryCmdEnv(trigger: TriggeredMessage, normal: boolean): Record<string, string> {
-  if (!memoryCmdEndpoint) return {};
-  const now = Date.now();
-  for (const [token, entry] of memoryCmdTokens) if (entry.expires <= now) memoryCmdTokens.delete(token);
-  const token = randomBytes(32).toString("hex");
-  memoryCmdTokens.set(token, { input: acceptedKnowledgeInput(trigger, normal), expires: now + 5 * 60_000 });
-  return { QQ_MEMORY_CMD_ENDPOINT: memoryCmdEndpoint, QQ_MEMORY_CMD_TOKEN: token };
-}
-
-const memoryCmdServer = createServer(async (req, res) => {
-  try {
-    if (req.method !== "POST" || req.url !== "/memory-command" || req.socket.remoteAddress !== "127.0.0.1") {
-      respondJson(res, 403, false, "仅允许本机命令请求");
-      return;
-    }
-    const auth = req.headers.authorization;
-    const token = typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : "";
-    const entry = /^[a-f0-9]{64}$/.test(token) ? memoryCmdTokens.get(token) : undefined;
-    if (!entry || entry.expires <= Date.now()) {
-      if (token) memoryCmdTokens.delete(token);
-      respondJson(res, 401, false, "记忆管理凭据已失效，请重新发送请求");
-      return;
-    }
-    if (!req.headers["content-type"]?.startsWith("application/json")) {
-      respondJson(res, 400, false, "需要 JSON");
-      return;
-    }
-    const chunks: Buffer[] = [];
-    let bytes = 0;
-    for await (const chunk of req) {
-      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      bytes += buf.length;
-      if (bytes > 4096) { respondJson(res, 413, false, "请求过长"); return; }
-      chunks.push(buf);
-    }
-    let payload: { command?: unknown };
-    try {
-      payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    } catch {
-      respondJson(res, 400, false, "无效 JSON");
-      return;
-    }
-    const command = typeof payload?.command === "string" ? payload.command.trim() : "";
-    if (!MEMORY_COMMANDS.has(command)) {
-      respondJson(res, 400, false, "未知记忆操作");
-      return;
-    }
-    const input = entry.input;
-    const normalizedSource = input.text.replace(/\s+/g, "");
-    const permitted = new RegExp(
-      `^(?:(?:请|麻烦|帮我|给我|我要|我想|能不能|可以|能否))*${command}[吧呀啊呗嘛呢哦。！？!?~～，,]*$`,
-    ).test(normalizedSource);
-    if (!permitted) {
-      respondJson(res, 403, false, "当前真实消息没有明确要求这个操作，未执行");
-      return;
-    }
-    if (!input.normal) {
-      respondJson(res, 200, false, "娱乐模式不使用这套记忆，请在正常模式下管理。");
-      return;
-    }
-    if (!knowledge) {
-      respondJson(res, 200, false, "自动记忆尚未配置。请设置 knowledge.enabled 和允许的 groups/privateUsers，再重启后在对应范围开启记忆。");
-      return;
-    }
-    const result = await knowledge.handleCommand({ ...input, text: command, addressed: true });
-    respondJson(res, 200, true, result ?? "当前记忆状态不允许这个操作。");
-  } catch (err) {
-    log("[memory-cmd] 处理失败:", err instanceof Error ? err.message : err);
-    respondJson(res, 500, false, "记忆命令处理失败");
-  }
-});
-
-try {
-  await new Promise<void>((resolve, reject) => {
-    memoryCmdServer.once("error", reject);
-    memoryCmdServer.listen(0, "127.0.0.1", () => {
-      memoryCmdServer.off("error", reject);
-      const addr = memoryCmdServer.address();
-      if (addr && typeof addr === "object") memoryCmdEndpoint = `http://127.0.0.1:${addr.port}/memory-command`;
-      resolve();
-    });
-  });
-  memoryCmdServer.unref();
-  log(`[memory-cmd] 本地命令通道已启动 ${memoryCmdEndpoint}`);
-} catch (err) {
-  log("[memory-cmd] 启动失败（记忆管理工具将不可用）:", err instanceof Error ? err.message : err);
+function botEnv(): Record<string, string> {
+  return { QQ_BOT_SELF_ID: config.bot.selfId };
 }
 
 async function replyText(trigger: TriggeredMessage, text: string, turn?: ReplyTurn): Promise<void> {
@@ -535,7 +401,7 @@ const taskScheduler = new TaskScheduler(
       runner.run(
         `[定时任务] 以下是院长预先设置并已授权的定时任务，直接执行，不要因为看不到发送者身份信息而拒绝。\n` +
           `注意：你的最终输出会被系统自动发送到目标群/私聊，**直接输出内容即可，不要再调用 send_group_message 等发送类工具**（否则会重复发送）。\n${prompt}`,
-        { mode: "web", model: modelRegistry[currentModel], priority: "scheduled", env: legacyToolEnv() },
+        { mode: "web", model: modelRegistry[currentModel], priority: "scheduled", env: botEnv() },
       ),
     sendTo: async (target, text) => {
       for (const chunk of splitText(redactSensitive(text))) {
@@ -614,8 +480,6 @@ client.onEvent((event) => {
     return;
   }
   if (event.post_type === "notice" && (event.notice_type === "group_recall" || event.notice_type === "friend_recall")) {
-    const scope = event.notice_type === "group_recall" ? `group:${String(event.group_id ?? "")}` : `private:${String(event.user_id ?? "")}`;
-    knowledge?.retract(scope, String(event.message_id ?? ""));
     if (event.notice_type === "group_recall") {
       const gid = String(event.group_id ?? "");
       const id = String(event.message_id ?? "");
@@ -739,7 +603,6 @@ async function handleTrigger(trigger: TriggeredMessage): Promise<void> {
 async function handleReplyTurn(trigger: TriggeredMessage, turn: ReplyTurn): Promise<void> {
   const normalAtEntry = !turn.entertainment;
   const cancelled: PiResult = { ok: false, text: "模式已切换，本轮已取消", durationMs: 0 };
-  const memoryInput = acceptedKnowledgeInput(trigger, normalAtEntry);
 
   // 所有正常提问（含模型管理、娱乐模式开关、记忆管理）统一交给 pi 判断，
   // 由模型按需调用 model_manage / mode_manage 等工具，桥接不再做关键词拦截。
@@ -751,12 +614,11 @@ async function handleReplyTurn(trigger: TriggeredMessage, turn: ReplyTurn): Prom
   const prev = pendingByKey.get(ctxKey) ?? Promise.resolve();
   const task = prev.catch(() => undefined).then(async () => {
     if (!turn.isCurrent()) return cancelled;
-    const managed = normalAtEntry && !!knowledge?.isManaged(memoryInput);
     if (turn.entertainment && !trigger.images?.length) {
       await waitForRecentMedia(trigger.groupId!, trigger.userId);
     }
     if (!turn.isCurrent()) return cancelled;
-    const session = managed ? { file: undefined, summary: "" } : await memorySessionFor(sessionKey, turn.signal);
+    const session = await memorySessionFor(sessionKey, turn.signal);
     if (!turn.isCurrent()) return cancelled;
     const { images, files, quotedText } = await attachments.collect(trigger);
     if (!turn.isCurrent()) return cancelled;
@@ -767,34 +629,7 @@ async function handleReplyTurn(trigger: TriggeredMessage, turn: ReplyTurn): Prom
     const imagePaths = images.length ? await attachments.materializeImages(images) : [];
     if (!turn.isCurrent()) return cancelled;
     const attachmentInfo = { missingImages: images.length - imagePaths.length, quotedText, entertainment: turn.entertainment };
-    if (managed && knowledge) {
-      let knowledgeTurn: KnowledgeTurn = { env: {}, contextBlock: "" };
-      try { knowledgeTurn = await knowledge.prepareTurn(memoryInput); }
-      catch { log("[knowledge] 采集失败，本轮不使用记忆凭据"); }
-      let result: PiResult = { ok: false, text: "记忆问答未完成", durationMs: 0 };
-      try {
-        if (!turn.isCurrent()) return cancelled;
-        const prompt = knowledgeContextPrompt(knowledgeTurn) + await buildPrompt(trigger, imagePaths.length, readyFiles, rejected, {
-          includeRecentChat: false, ...attachmentInfo,
-        });
-        if (!turn.isCurrent()) return cancelled;
-        result = await runner.run(prompt, {
-          mode: "knowledge", model: modelRegistry[currentModel], env: { ...legacyToolEnv(), ...knowledgeTurn.env, ...memoryCmdEnv(trigger, normalAtEntry) },
-          imagePaths: [...imagePaths, ...readyFiles.map((f) => f.path)], signal: turn.signal,
-        });
-        if (!turn.isCurrent()) result = cancelled;
-        if (!knowledge.isTurnCurrent(knowledgeTurn)) {
-          result = { ok: false, text: "本次记忆权限或资料已撤销，已停止使用旧上下文，请重新提问。", durationMs: result.durationMs };
-        }
-        return result;
-      } finally {
-        await knowledge.finishTurn(knowledgeTurn, {
-          ok: result.ok && turn.isCurrent(), text: redactSensitive(stripMarkdown(normalReplyText(result.text, trigger.text))),
-        }).catch(() => log("[knowledge] 回复上下文保存失败"));
-      }
-    }
-    const legacyPersonalAllowed = !knowledge?.isManaged({ ...memoryInput, kind: "private", groupId: undefined });
-    const sel = legacyPersonalAllowed ? selectMemories(trigger.userId, trigger.text) : { lines: [], total: 0 };
+    const sel = selectMemories(trigger.userId, trigger.text);
     const memoBlock = sel.lines.length
       ? `[关于${trigger.kind === "group" ? "该发言者" : "该用户"}的长期记忆（共 ${sel.total} 条，以下 ${sel.lines.length} 条与本次相关；需要更多可用 recall 工具查询）]\n${sel.lines.join("\n")}\n\n`
       : "";
@@ -802,9 +637,9 @@ async function handleReplyTurn(trigger: TriggeredMessage, turn: ReplyTurn): Prom
       ? `[此前${trigger.kind === "group" ? "本群的" : "与该用户的"}对话摘要（更早内容已压缩）]\n${session.summary}\n\n`
       : "") + await buildPrompt(trigger, imagePaths.length, readyFiles, rejected, attachmentInfo);
     if (!turn.isCurrent()) return cancelled;
-    if (legacyPersonalAllowed) maybeMergeMemories(trigger.userId).catch(() => {});
+    maybeMergeMemories(trigger.userId).catch(() => {});
     const result = await runner.run(prompt, {
-      mode: "web", model: modelRegistry[currentModel], sessionFile: session.file, env: { ...legacyToolEnv(), ...memoryCmdEnv(trigger, normalAtEntry) },
+      mode: "web", model: modelRegistry[currentModel], sessionFile: session.file, env: botEnv(),
       imagePaths: [...imagePaths, ...readyFiles.map((f) => f.path)], signal: turn.signal,
     });
     if (trigger.kind === "group" && normalAtEntry && turn.isCurrent() && result.ok
@@ -1328,7 +1163,6 @@ async function shutdown(): Promise<void> {
   client.close();
   await mediaContext.close();
   await runner.close();
-  await knowledge?.close();
   process.exit(0);
 }
 for (const signal of ["SIGINT", "SIGTERM"] as const) {

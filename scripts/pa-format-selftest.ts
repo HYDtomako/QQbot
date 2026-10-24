@@ -22,7 +22,7 @@ const longReport = [
   "",
   "备份在 workspace/backup/stickers-manifest.json.20261012-014937.bak。",
 ].join("\n");
-const prompt = buildCompactPrompt(longReport, 400, "private:2804956879");
+const prompt = buildCompactPrompt(longReport, 400, "private:10001");
 assert.ok(prompt.includes(longReport), "prompt must embed the full report");
 assert.ok(prompt.includes("400 字"));
 assert.ok(prompt.includes("QQ 私聊"));
@@ -43,7 +43,7 @@ let seenPrompt = "";
 const compacted = await compactPaReply(longReport, async (p) => {
   seenPrompt = p;
   return "结论：表情包问题已修好，但线上跑的还是旧代码，需要重启 bot 才生效。要现在重启吗？";
-}, { via: "private:2804956879" });
+}, { via: "private:10001" });
 assert.equal(compacted, "结论：表情包问题已修好，但线上跑的还是旧代码，需要重启 bot 才生效。要现在重启吗？");
 assert.ok(seenPrompt.includes(longReport));
 assert.equal(await compactPaReply(longReport, async () => ""), "", "empty model output must fall back");

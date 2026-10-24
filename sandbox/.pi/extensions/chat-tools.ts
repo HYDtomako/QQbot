@@ -26,7 +26,6 @@ interface ToolResult {
 import path from "node:path";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { isLegacyProtected } from "../knowledge-guard.ts";
 import { parseChatLog, renderChatMessage } from "../../../src/group-chat.ts";
 import { recordedReplyText } from "../../../src/reply-policy.ts";
 
@@ -79,9 +78,8 @@ export default function chatToolsExtension(pi: ExtensionAPI) {
 
       const gid = String(params.group_id ?? "").trim();
       if (gid && !/^[1-9]\d{4,19}$/.test(gid)) return text("群号格式无效。");
-      if (gid && isLegacyProtected("group", gid)) return text("该群已由隔离记忆系统接管，旧日志工具不能读取；请在对应群正常 @ 查询已授权知识。");
       const files = existsSync(LOG_DIR)
-        ? readdirSync(LOG_DIR).filter((f) => f.endsWith(".jsonl") && !isLegacyProtected("group", f.split("-")[0])).map((f) => f.replace(/\.jsonl$/, ""))
+        ? readdirSync(LOG_DIR).filter((f) => f.endsWith(".jsonl")).map((f) => f.replace(/\.jsonl$/, ""))
         : [];
       if (!files.length) return text("没有可由旧日志工具读取的群记录。");
       const target = gid || (files.length === 1 ? files[0].split("-").slice(0, -3).join("-") : "");

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { ChildProcess, spawn } from "node:child_process";
+import { ChildProcess } from "node:child_process";
 import { getEventListeners } from "node:events";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
@@ -10,14 +10,9 @@ import { PiRunner, type PiResult, type PiRunnerOptions } from "../src/runner.ts"
 
 // 用法：node scripts/runner-selftest.ts。只启动 Node fixture，所有事件文件均在临时目录。
 const fixture = fileURLToPath(new URL("./fixtures/pi-runner-fixture.mjs", import.meta.url));
-const script = fileURLToPath(import.meta.url);
 const temp = mkdtempSync(path.join(os.tmpdir(), "pi-runner-selftest-"));
 const runners = new Set<PiRunner>();
 let sequence = 0;
-const knowledgeTools = [
-  "web_search", "web_read", "current_time", "schedule_query", "model_manage", "mode_manage",
-  "memory_search", "memory_get", "memory_save", "memory_correct", "memory_forget", "memory_manage",
-];
 
 type Event = { id: string; pid: number; args: string[]; env: Record<string, string>; type: string; time: number };
 const prompt = (id: string, extra: Record<string, unknown> = {}) => JSON.stringify({ id, ...extra });
@@ -71,35 +66,11 @@ function echo(result: PiResult): Event {
   return JSON.parse(result.text);
 }
 
-function hasKnowledgeEnv(env: Record<string, string>): boolean {
-  return Object.keys(env).some((key) => ["QQ_KNOWLEDGE_ENDPOINT", "QQ_KNOWLEDGE_TOKEN"].includes(key.toUpperCase()));
-}
-
-function noCredentials(event: Event) { assert.equal(hasKnowledgeEnv(event.env), false); }
 function starts(file: string) { return events(file).filter((e) => e.type === "start").map((e) => e.id); }
 function tools(event: Event) { return event.args[event.args.indexOf("--tools") + 1].split(","); }
 function alive(pid: number) {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
-
-const inheritedProbe = async () => {
-  const { runner } = create({ env: { SELFTEST_VALUE: "global-value" } });
-  for (const mode of ["knowledge", "none", "web", "full"] as const) {
-    const event = echo(await runner.run(prompt(mode), { mode }));
-    noCredentials(event);
-    assert.equal(event.env.SELFTEST_INHERITED, "synthetic-inherited");
-    assert.equal(event.env.SELFTEST_VALUE, "global-value");
-  }
-  const event = echo(await runner.run(prompt("own-token"), {
-    mode: "knowledge", env: { SELFTEST_VALUE: "task-value", QQ_KNOWLEDGE_ENDPOINT: "synthetic-task-endpoint", QQ_KNOWLEDGE_TOKEN: "synthetic-task-token" },
-  }));
-  assert.equal(event.env.SELFTEST_VALUE, "task-value");
-  assert.equal(event.env.QQ_KNOWLEDGE_TOKEN, "synthetic-task-token");
-  assert.equal(event.env.QQ_KNOWLEDGE_ENDPOINT, "synthetic-task-endpoint");
-  // 这些值只来自自测父进程注入的合成凭据，不读取真实密钥。
-  assert.equal(process.env.QQ_KNOWLEDGE_TOKEN, "synthetic-inherited-token");
-  assert.equal(process.env.QQ_KNOWLEDGE_ENDPOINT, "synthetic-inherited-endpoint");
-};
 
 const tests: Array<[string, () => Promise<void>]> = [
   ["旧 opts/run 调用兼容，默认 web，无 session，保留其他参数", async () => {
@@ -113,16 +84,6 @@ const tests: Array<[string, () => Promise<void>]> = [
     assert.equal(event.args[event.args.indexOf("--thinking") + 1], "low");
     assert.equal(event.args[event.args.indexOf("--model") + 1], "synthetic-model");
     assert.equal(event.args.at(-2), "@synthetic-image.png");
-  }],
-  ["knowledge 严格八项白名单，清理 paired/equals 参数冲突", async () => {
-    const { runner } = create({ args: [fixture, "-p", "--tools", "send_group_message,remember", "--tools=recall", "--no-tools", "--no-tools=true", "--session", "old-session", "--session=other-session", "--no-session", "--no-session=true", "--approve"] });
-    const event = echo(await runner.run(prompt("knowledge"), { mode: "knowledge" }));
-    assert.deepEqual(tools(event), knowledgeTools);
-    assert.equal(event.args.filter((a) => a === "--tools").length, 1);
-    assert.equal(event.args.filter((a) => a === "--no-session").length, 1);
-    for (const stale of ["--no-tools", "old-session", "other-session", "send_group_message,remember"]) assert.ok(!event.args.includes(stale));
-    assert.ok(!event.args.some((a) => a.startsWith("--tools=") || a.startsWith("--session=") || a.startsWith("--no-tools=")));
-    assert.ok(event.args.includes("-p") && event.args.includes("--approve"));
   }],
   ["none 强制 no-tools，可显式 session 用于摘要", async () => {
     const { runner } = create({ args: [fixture, "-p", "--tools=remember", "--no-session", "--session", "obsolete"] });
@@ -151,63 +112,38 @@ const tests: Array<[string, () => Promise<void>]> = [
     assert.ok(!event.args.includes("--no-session"));
     assert.ok(!event.args.some((arg) => arg.includes("synthetic-summary-hook") || arg.includes("synthetic-other-hook")));
   }],
-  ["knowledge/web/full 保留所有原扩展路径，不自动添加禁扩展参数", async () => {
+  ["web/full 保留所有原扩展路径，不自动添加禁扩展参数", async () => {
     const extensionArgs = ["--extension", "synthetic-a.ts", "-e", "synthetic-b.ts", "--extension=synthetic-c.ts", "-e=synthetic-d.ts"];
     const { runner } = create({ args: [fixture, "-p", ...extensionArgs] });
-    for (const mode of ["knowledge", "web", "full"] as const) {
+    for (const mode of ["web", "full"] as const) {
       const event = echo(await runner.run(prompt(`${mode}-extensions`), { mode }));
       assert.deepEqual(event.args.slice(1, 1 + extensionArgs.length), extensionArgs);
       assert.ok(!event.args.includes("--no-extensions") && !event.args.includes("-ne"));
-      if (mode === "knowledge") assert.deepEqual(tools(event), knowledgeTools);
     }
   }],
-  ["full 仅显式可选，不带 knowledge token", async () => {
-    const { runner } = create({ args: [fixture, "-p", "--tools", "remember", "--no-tools"], env: { QQ_KNOWLEDGE_TOKEN: "synthetic-global" } });
-    const event = echo(await runner.run(prompt("full"), { mode: "full", env: { QQ_KNOWLEDGE_TOKEN: "synthetic-task", QQ_KNOWLEDGE_ENDPOINT: "synthetic-endpoint" } }));
+  ["full 仅显式可选", async () => {
+    const { runner } = create({ args: [fixture, "-p", "--tools", "remember", "--no-tools"] });
+    const event = echo(await runner.run(prompt("full"), { mode: "full" }));
     assert.ok(!event.args.includes("--tools") && !event.args.includes("--no-tools"));
-    noCredentials(event);
   }],
-  ["每 run env 合并、快照与 token 顺序隔离", async () => {
-    const { runner } = create({ env: { SELFTEST_GLOBAL: "global", SELFTEST_VALUE: "global", QQ_KNOWLEDGE_TOKEN: "synthetic-global", qq_knowledge_endpoint: "synthetic-global-endpoint" } });
+  ["每 run env 合并与快照隔离", async () => {
+    const { runner } = create({ env: { SELFTEST_GLOBAL: "global", SELFTEST_VALUE: "global" } });
     for (const token of ["A", "B"]) {
-      const event = echo(await runner.run(prompt(token), { mode: "knowledge", env: { SELFTEST_VALUE: token, QQ_KNOWLEDGE_ENDPOINT: `synthetic-${token}`, QQ_KNOWLEDGE_TOKEN: token } }));
+      const event = echo(await runner.run(prompt(token), { mode: "web", env: { SELFTEST_VALUE: token } }));
       assert.equal(event.env.SELFTEST_GLOBAL, "global");
       assert.equal(event.env.SELFTEST_VALUE, token);
-      assert.equal(event.env.QQ_KNOWLEDGE_TOKEN, token);
-      assert.equal(event.env.QQ_KNOWLEDGE_ENDPOINT, `synthetic-${token}`);
-      assert.ok(!("qq_knowledge_endpoint" in event.env));
     }
-    noCredentials(echo(await runner.run(prompt("knowledge-no-token"), { mode: "knowledge" })));
-    for (const mode of ["none", "web", "full"] as const) {
-      noCredentials(echo(await runner.run(prompt(mode), { mode, env: { qq_knowledge_token: "synthetic-lowercase", QQ_KNOWLEDGE_ENDPOINT: "synthetic-endpoint" } })));
-    }
-    noCredentials(echo(await runner.run(prompt("background"), { mode: "none", priority: "background", env: { QQ_KNOWLEDGE_TOKEN: "synthetic-background" } })));
   }],
-  ["并行 knowledge 任务 token 与普通任务隔离", async () => {
+  ["并行任务 env 快照隔离", async () => {
     const { runner } = create({ maxConcurrent: 3 });
     const results = await Promise.all([
-      runner.run(prompt("A", { waitMs: 100 }), { mode: "knowledge", env: { QQ_KNOWLEDGE_TOKEN: "A" } }),
-      runner.run(prompt("B", { waitMs: 100 }), { mode: "knowledge", env: { QQ_KNOWLEDGE_TOKEN: "B" } }),
-      runner.run(prompt("entertainment"), { mode: "none", env: { QQ_KNOWLEDGE_TOKEN: "must-not-leak" } }),
+      runner.run(prompt("A", { waitMs: 100 }), { mode: "web", env: { SELFTEST_VALUE: "A" } }),
+      runner.run(prompt("B", { waitMs: 100 }), { mode: "web", env: { SELFTEST_VALUE: "B" } }),
+      runner.run(prompt("entertainment"), { mode: "none", env: { SELFTEST_VALUE: "C" } }),
     ]);
-    assert.equal(echo(results[0]).env.QQ_KNOWLEDGE_TOKEN, "A");
-    assert.equal(echo(results[1]).env.QQ_KNOWLEDGE_TOKEN, "B");
-    noCredentials(echo(results[2]));
-  }],
-  ["process.env 继承凭据也被移除，不修改父进程环境", async () => {
-    const env = { ...process.env };
-    for (const key of Object.keys(env)) if (key.toUpperCase().startsWith("QQ_KNOWLEDGE_")) delete env[key];
-    env.QQ_KNOWLEDGE_TOKEN = "synthetic-inherited-token";
-    env.QQ_KNOWLEDGE_ENDPOINT = "synthetic-inherited-endpoint";
-    env.SELFTEST_INHERITED = "synthetic-inherited";
-    env.SELFTEST_VALUE = "inherited-value";
-    const child = spawn(process.execPath, [script, "--inherited-probe"], { env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
-    let output = "";
-    child.stdout.on("data", (data: Buffer) => { output += data.toString(); });
-    child.stderr.on("data", (data: Buffer) => { output += data.toString(); });
-    const code = await bounded(new Promise<number | null>((resolve, reject) => { child.once("error", reject); child.once("close", resolve); }), 15_000);
-    assert.equal(code, 0, output);
-    assert.ok(output.includes("inherited probe PASS"), output);
+    assert.equal(echo(results[0]).env.SELFTEST_VALUE, "A");
+    assert.equal(echo(results[1]).env.SELFTEST_VALUE, "B");
+    assert.equal(echo(results[2]).env.SELFTEST_VALUE, "C");
   }],
   ["三层排队优先级 interactive > scheduled > background", async () => {
     const { runner, eventFile } = create({ maxConcurrent: 1 });
@@ -448,13 +384,12 @@ const tests: Array<[string, () => Promise<void>]> = [
     const controller = new AbortController();
     const active = runner.run(prompt("blocker", { waitMs: 60_000 }), { signal: controller.signal });
     await started(eventFile, "blocker");
-    const env = { QQ_KNOWLEDGE_TOKEN: "original", SELFTEST_VALUE: "original" };
+    const env = { SELFTEST_VALUE: "original" };
     const imagePaths = ["original.png"];
-    const queued = runner.run(prompt("snapshot"), { mode: "knowledge", env, imagePaths });
-    env.QQ_KNOWLEDGE_TOKEN = "mutated"; env.SELFTEST_VALUE = "mutated"; imagePaths[0] = "mutated.png";
+    const queued = runner.run(prompt("snapshot"), { mode: "web", env, imagePaths });
+    env.SELFTEST_VALUE = "mutated"; imagePaths[0] = "mutated.png";
     controller.abort(); await bounded(active);
     const event = echo(await bounded(queued));
-    assert.equal(event.env.QQ_KNOWLEDGE_TOKEN, "original");
     assert.equal(event.env.SELFTEST_VALUE, "original");
     assert.ok(event.args.includes("@original.png") && !event.args.includes("@mutated.png"));
   }],
@@ -473,25 +408,20 @@ async function cleanup() {
 }
 
 try {
-  if (process.argv.includes("--inherited-probe")) {
-    await inheritedProbe();
-    console.log("inherited probe PASS");
-  } else {
-    let passed = 0;
-    let failed = 0;
-    for (const [name, run] of tests) {
-      try {
-        await run();
-        passed++;
-        console.log(`PASS ${name}`);
-      } catch (err) {
-        failed++;
-        console.error(`FAIL ${name}\n${err instanceof Error ? err.stack : String(err)}`);
-      } finally { await cleanup(); }
-    }
-    console.log(`runner-selftest: ${passed}/${tests.length} passed, ${failed} failed`);
-    if (failed) process.exitCode = 1;
+  let passed = 0;
+  let failed = 0;
+  for (const [name, run] of tests) {
+    try {
+      await run();
+      passed++;
+      console.log(`PASS ${name}`);
+    } catch (err) {
+      failed++;
+      console.error(`FAIL ${name}\n${err instanceof Error ? err.stack : String(err)}`);
+    } finally { await cleanup(); }
   }
+  console.log(`runner-selftest: ${passed}/${tests.length} passed, ${failed} failed`);
+  if (failed) process.exitCode = 1;
 } finally {
   await cleanup();
   rmSync(temp, { recursive: true, force: true });

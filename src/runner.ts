@@ -7,7 +7,7 @@ export interface PiResult {
   durationMs: number;
 }
 
-export type PiMode = "full" | "web" | "none" | "knowledge";
+export type PiMode = "full" | "web" | "none";
 export type PiPriority = "interactive" | "scheduled" | "background";
 
 export interface PiRunOptions {
@@ -47,9 +47,7 @@ interface Job {
 
 const MAX_CAPTURE = 200_000; // 每个输出流最多保留这些字节，包含单次大块输出
 const CLOSE_GRACE_MS = 1_000; // kill 后即使没有 close 事件，也释放任务和并发槽
-const KNOWLEDGE_KEYS = new Set(["QQ_KNOWLEDGE_ENDPOINT", "QQ_KNOWLEDGE_TOKEN"]);
-const KNOWLEDGE_TOOLS = "web_search,web_read,current_time,schedule_query,model_manage,mode_manage,memory_search,memory_get,memory_save,memory_correct,memory_forget,memory_manage";
-const WEB_TOOLS = "web_search,web_read,group_members,member_info,schedule_query,chat_digest,task_manage,remember,recall,forget,current_time,send_group_message,model_manage,mode_manage,memory_manage,tell_guga";
+const WEB_TOOLS = "web_search,web_read,group_members,member_info,schedule_query,chat_digest,task_manage,remember,recall,forget,current_time,send_group_message,model_manage,mode_manage,tell_guga";
 
 /** 去除配置中旧的工具/会话参数；任务参数是唯一权威来源。 */
 function normalizeArgs(args: string[], withoutExtensions = false): string[] {
@@ -69,18 +67,7 @@ function normalizeArgs(args: string[], withoutExtensions = false): string[] {
 }
 
 function taskEnv(globalEnv: Record<string, string> | undefined, job: Job): NodeJS.ProcessEnv {
-  const env = { ...process.env, ...globalEnv, ...job.options.env };
-  // Windows 环境变量名不区分大小写，必须同时清理大小写变体。
-  for (const key of Object.keys(env)) {
-    if (KNOWLEDGE_KEYS.has(key.toUpperCase())) delete env[key];
-  }
-  if (job.mode === "knowledge") {
-    // 只能从该任务取得凭据，绝不回退到 runner 或 process 的环境。
-    for (const [key, value] of Object.entries(job.options.env ?? {})) {
-      if (KNOWLEDGE_KEYS.has(key.toUpperCase())) env[key.toUpperCase()] = value;
-    }
-  }
-  return env;
+  return { ...process.env, ...globalEnv, ...job.options.env };
 }
 
 class LimitedCapture {
@@ -131,7 +118,7 @@ export class PiRunner {
     if (options.timeoutMs !== undefined && !validTimeout(options.timeoutMs)) return rejected("无效的任务 timeoutMs");
     const mode = options.mode ?? "web";
     const priority = options.priority ?? "interactive";
-    if (!["full", "web", "none", "knowledge"].includes(mode) || !Object.hasOwn(this.queues, priority)) {
+    if (!["full", "web", "none"].includes(mode) || !Object.hasOwn(this.queues, priority)) {
       return rejected("无效的任务 mode 或 priority");
     }
     if (this.queuedJobs().length >= this.opts.maxQueue!) return rejected("runner 排队已满");
@@ -234,7 +221,6 @@ export class PiRunner {
     // none 必须禁自动发现，并移除显式 -e（它会覆盖 --no-extensions）。
     const args = job.mode === "none" ? normalizeArgs(this.opts.args, true) : [...this.opts.args];
     if (job.mode === "none") args.push("--no-tools", "--no-extensions");
-    else if (job.mode === "knowledge") args.push("--tools", KNOWLEDGE_TOOLS);
     else if (job.mode === "web") args.push("--tools", WEB_TOOLS);
     if (this.opts.thinking) args.push("--thinking", this.opts.thinking);
     if (job.options.model) args.push("--model", job.options.model);

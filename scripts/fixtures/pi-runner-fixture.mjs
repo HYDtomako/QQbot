@@ -8,7 +8,7 @@ const args = process.argv.slice(2);
 const spec = JSON.parse(args.at(-1));
 const env = {};
 for (const [key, value] of Object.entries(process.env)) {
-  if (key.toUpperCase().startsWith("QQ_KNOWLEDGE_") || key.startsWith("SELFTEST_")) env[key] = value;
+  if (key.startsWith("SELFTEST_")) env[key] = value;
 }
 const event = { id: spec.id, pid: process.pid, args, env, time: Date.now() };
 const record = (type) => {
