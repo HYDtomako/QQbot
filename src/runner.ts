@@ -47,7 +47,7 @@ interface Job {
 
 const MAX_CAPTURE = 200_000; // 每个输出流最多保留这些字节，包含单次大块输出
 const CLOSE_GRACE_MS = 1_000; // kill 后即使没有 close 事件，也释放任务和并发槽
-const WEB_TOOLS = "web_search,web_read,group_members,member_info,schedule_query,chat_digest,task_manage,remember,recall,forget,current_time,send_group_message,model_manage,mode_manage,tell_guga";
+const WEB_TOOLS = "web_search,web_read,group_members,member_info,schedule_query,chat_digest,task_manage,remember,recall,forget,current_time,send_group_message,model_manage,mode_manage,tell_guga,voice_send";
 
 /** 去除配置中旧的工具/会话参数；任务参数是唯一权威来源。 */
 function normalizeArgs(args: string[], withoutExtensions = false): string[] {

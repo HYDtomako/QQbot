@@ -66,6 +66,36 @@ export interface BotConfig {
       /** 可选视觉模型别名或 pi 模型规格；不填跟随当前对话模型。 */
       model?: string;
     };
+    /** 娱乐模式语音回复（MiniMax T2A / fish.audio）；缺省或 enabled=false 视为关闭。 */
+    tts?: {
+      enabled?: boolean;
+      /** 合成服务商：minimax（缺省，老配置行为不变）或 fish。 */
+      provider?: "minimax" | "fish";
+      /** fish 走的本机 SOCKS5 代理，形如 socks5://127.0.0.1:10808；空串表示直连。 */
+      proxy?: string;
+      /** 服务密钥；缺失时功能保持关闭，不会被记录或发送。 */
+      apiKey?: string;
+      /** 接口根地址：minimax 实际请求 `{baseUrl}/v1/t2a_v2`，fish 请求 `{baseUrl}/v1/tts`。 */
+      baseUrl?: string;
+      /** 语音模型：minimax 默认 speech-2.8-turbo，fish 用 s2.1-pro-free。 */
+      model?: string;
+      /** 音色 ID：minimax 默认 female-shaonv，fish 为 reference_id。 */
+      voiceId?: string;
+      speed?: number;
+      vol?: number;
+      pitch?: number;
+      /** 每条纯文字回复转语音的概率 0~1，默认 0.35。 */
+      probability?: number;
+      /** 可朗读文本的最大字数，默认 80。 */
+      maxChars?: number;
+      /** 音频格式，默认 mp3。 */
+      format?: string;
+      /**
+       * 是否允许院长与白名单以外的人调用 voice_send 指定语音；
+       * 缺省 false（仅院长与白名单可用），不影响上面的概率钩子。
+       */
+      allowOthers?: boolean;
+    };
   };
   jw?: {
     user: string;

@@ -14,7 +14,10 @@
     "selftest:media": "node scripts/message-content-selftest.ts && node scripts/media-context-selftest.ts && node scripts/media-smoke-selftest.ts",
     "probe:vision": "node scripts/vision-probe.ts",
     "selftest:modes": "node scripts/reply-policy-selftest.ts && node scripts/mode-switch-selftest.ts",
-    "selftest:pa-format": "node scripts/pa-format-selftest.ts"
+    "selftest:pa-format": "node scripts/pa-format-selftest.ts",
+    "selftest:tts": "node scripts/tts-selftest.ts",
+    "selftest:tts-fish": "node scripts/tts-fish-selftest.ts",
+    "selftest:voice": "node scripts/voice-send-selftest.ts && node scripts/voice-bridge-selftest.ts"
   },
   "dependencies": {
     "@napi-rs/canvas": "^1.0.9",

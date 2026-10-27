@@ -6,7 +6,8 @@ import { OneBotClient, type MessageSegment } from "./onebot.ts";
 import { matchMessage, type TriggeredMessage } from "./router.ts";
 import { createAttachments, type MaterializedFile } from "./attachments.ts";
 import { PiRunner, type PiResult } from "./runner.ts";
-import { randomUUID } from "node:crypto";
+import { randomUUID, randomBytes } from "node:crypto";
+import { createServer, type ServerResponse } from "node:http";
 import { describeEmoji, parseMessageContent } from "./message-content.ts";
 import { chatDate, readRecentChat, renderChatMessage, MEDIA_CONTEXT_RULES } from "./group-chat.ts";
 import { MediaContext } from "./media-context.ts";
@@ -21,6 +22,8 @@ import { Modes } from "./modes.ts";
 import { DynamicReplyGate, estimateReplyProbability } from "./gate.ts";
 import { StickerLibrary, parseEntertainmentReply, stickerPrompt, type StickerEntry } from "./stickers.ts";
 import { compactPaReply, needsPaCleanup, PA_REPLY_MAX_CHARS } from "./pa-format.ts";
+import { trySendVoice } from "./tts.ts";
+import { runVoiceSend } from "./voice-tool.ts";
 
 const log = (...args: unknown[]) => console.log(new Date().toISOString(), ...args);
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -158,11 +161,61 @@ async function proactiveSay(gid: string): Promise<void> {
 }
 
 /**
+ * 娱乐模式发送前决定形态：满足条件时把这条纯文字回复改成语音。
+ * 返回 true 表示语音已发出；任何失败都返回 false，调用方照常发文字。
+ */
+async function trySendEntertainmentVoice(gid: string, text: string, turn: ReplyTurn): Promise<boolean> {
+  const cfg = config.entertainment?.tts;
+  if (cfg?.enabled !== true) return false;
+  if (!turn.isCurrent()) return false;
+  try {
+    const result = await trySendVoice({
+      cfg,
+      groupId: gid,
+      isEntertainmentGroup: turn.entertainment && modes.isEntertainment(gid),
+      text,
+      deps: {
+        signal: turn.signal,
+        log,
+        sendRecord: async (groupId, audio) => {
+          const sent = await client.sendGroupRecord(groupId, audio);
+          return sent.status === "ok" && sent.retcode === 0;
+        },
+      },
+    });
+    return result.sent;
+  } catch (err) {
+    // 语音是可选形态，任何意外都必须让调用方继续走文字路径
+    log(`[tts] 语音流程异常，回退文字: ${err instanceof Error ? err.message : err}`);
+    return false;
+  }
+}
+
+/** 娱乐模式发言后的记账：近期窗口、门控、表情包冷却和群聊历史统一处理。 */
+function recordEntertainmentDelivery(gid: string, content: string, stickerId: string | null, ts: number = Date.now()): void {
+  const st = entStates.get(gid);
+  if (st) {
+    st.recent.push({ ts, isBot: true });
+    st.gate.recordReply(ts);
+  }
+  groupLastBotAt.set(gid, ts);
+  stickerLibrary.recordSent(gid, stickerId, ts);
+  // 群聊历史会回喂模型，不能写入素材 ID 或内部协议标注。
+  writeChatLine(gid, config.bot.selfId, config.bot.nickname, content, true);
+}
+
+/**
  * 娱乐模式回复落地：解析回复协议 → 组装文本/表情包消息 → 发送并记账。
  * 表情包按 ID 校验后发送原文件字节；图片被明确拒绝时回退纯文字；协议解析不了整条放弃。
+ * 纯文字回复在发送前尝试语音（tts 关闭或条件不满足时完全按原路径发文字）。
  */
 async function sendEntertainmentReply(gid: string, raw: string, choices: StickerEntry[], label: string, turn: ReplyTurn): Promise<void> {
   if (!turn.entertainment || !turn.isCurrent()) return;
+  // 本轮已经用语音回复过（voice_send 成功）：文字和表情包都不再补发，直接结束
+  if (turn.voiceSent()) {
+    log(`[ent] 本轮已发语音，跳过${label}文字/表情包 -> 群 ${gid}`);
+    return;
+  }
   const reply = parseEntertainmentReply(raw, choices);
   if (!reply.valid) {
     log(`[ent] 忽略无法解析的回复 -> 群 ${gid}`);
@@ -184,6 +237,11 @@ async function sendEntertainmentReply(gid: string, raw: string, choices: Sticker
     return;
   }
   try {
+    if (!image && text && await trySendEntertainmentVoice(gid, text, turn)) {
+      recordEntertainmentDelivery(gid, text, null);
+      log(`[ent] ${label}（语音）-> 群 ${gid}: ${text.length} 字`);
+      return;
+    }
     if (!image && text.length > MAX_SEGMENT_LEN) {
       // 纯文字超长时按普通分片发送；带图的消息文字很短，不需要分片
       for (const chunk of splitText(text)) {
@@ -209,16 +267,8 @@ async function sendEntertainmentReply(gid: string, raw: string, choices: Sticker
       }
     }
     const ts = Date.now();
-    const st = entStates.get(gid);
-    if (st) {
-      st.recent.push({ ts, isBot: true });
-      st.gate.recordReply(ts);
-    }
-    groupLastBotAt.set(gid, ts);
-    stickerLibrary.recordSent(gid, sticker?.id ?? null, ts);
-    // 群聊历史会回喂模型，不能写入素材 ID 或内部协议标注。
     const content = [text, sticker ? "[表情包]" : ""].filter(Boolean).join(" ");
-    writeChatLine(gid, config.bot.selfId, config.bot.nickname, content, true);
+    recordEntertainmentDelivery(gid, content, sticker?.id ?? null, ts);
     log(`[ent] ${label} -> 群 ${gid}: ${content.slice(0, 80)}`);
   } catch (err) {
     log(`[ent] ${label}失败:`, err instanceof Error ? err.message : err);
@@ -299,6 +349,119 @@ let currentModel = loadCurrentModel();
 
 function botEnv(): Record<string, string> {
   return { QQ_BOT_SELF_ID: config.bot.selfId };
+}
+
+// ── 语音工具：模型调用 voice_send → 桥接合成并发到当前群（仅娱乐模式群、仅院长/白名单）──
+interface VoiceCommandInput {
+  kind: "group" | "private";
+  userId: string;
+  groupId?: string;
+}
+const voiceCmdTokens = new Map<string, { input: VoiceCommandInput; turn: ReplyTurn; expires: number }>();
+let voiceCmdEndpoint = "";
+
+function respondJson(res: ServerResponse, status: number, ok: boolean, text: string): void {
+  if (res.writableEnded || res.destroyed) return;
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+  res.end(JSON.stringify({ ok, text }));
+}
+
+/** 每次进入 pi 运行前发一个短期凭据，绑定当前会话身份；工具只能提交文本，不能指定目标群。 */
+function voiceCmdEnv(trigger: TriggeredMessage, turn: ReplyTurn): Record<string, string> {
+  if (!voiceCmdEndpoint) return {};
+  const now = Date.now();
+  for (const [token, entry] of voiceCmdTokens) if (entry.expires <= now) voiceCmdTokens.delete(token);
+  const token = randomBytes(32).toString("hex");
+  voiceCmdTokens.set(token, {
+    input: { kind: trigger.kind, userId: trigger.userId, groupId: trigger.groupId },
+    turn,
+    expires: now + 5 * 60_000,
+  });
+  return { QQ_VOICE_ENDPOINT: voiceCmdEndpoint, QQ_VOICE_TOKEN: token };
+}
+
+const voiceCmdServer = createServer(async (req, res) => {
+  try {
+    if (req.method !== "POST" || req.url !== "/voice-send" || req.socket.remoteAddress !== "127.0.0.1") {
+      respondJson(res, 403, false, "仅允许本机语音请求");
+      return;
+    }
+    const auth = req.headers.authorization;
+    const token = typeof auth === "string" && auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    const entry = /^[a-f0-9]{64}$/.test(token) ? voiceCmdTokens.get(token) : undefined;
+    if (!entry || entry.expires <= Date.now()) {
+      if (token) voiceCmdTokens.delete(token);
+      respondJson(res, 401, false, "命令凭据已失效，请重新发送请求");
+      return;
+    }
+    if (!req.headers["content-type"]?.startsWith("application/json")) {
+      respondJson(res, 400, false, "需要 JSON");
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    for await (const chunk of req) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += buf.length;
+      if (bytes > 16_384) { respondJson(res, 413, false, "请求过长"); return; }
+      chunks.push(buf);
+    }
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+    } catch {
+      respondJson(res, 400, false, "无效 JSON");
+      return;
+    }
+    if (!entry.turn.isCurrent()) {
+      respondJson(res, 409, false, "本轮已结束，语音未发送。");
+      return;
+    }
+    const input = entry.input;
+    const groupId = input.kind === "group" ? String(input.groupId ?? "").trim() : "";
+    const result = await runVoiceSend({
+      groupId,
+      input: {
+        cfg: config.entertainment?.tts,
+        isEntertainmentGroup: groupId !== "" && entry.turn.entertainment && modes.isEntertainment(groupId),
+        asker: input.userId,
+        owner: config.bot.owner,
+        whitelist: config.bot.whitelist,
+        text: payload.text,
+        voice: payload.voice,
+      },
+      deps: {
+        signal: entry.turn.signal,
+        log,
+        sendRecord: async (targetGroupId, audio) => {
+          const sent = await client.sendGroupRecord(targetGroupId, audio);
+          return sent.status === "ok" && sent.retcode === 0;
+        },
+      },
+    });
+    // 语音已经作为本轮回复发出去：给回合打标，后面的文字/表情包一律不再补发
+    if (result.ok) entry.turn.markVoiceSent();
+    respondJson(res, 200, result.ok, result.text);
+  } catch (err) {
+    log("[voice-cmd] 处理失败:", err instanceof Error ? err.message : err);
+    respondJson(res, 500, false, "语音命令处理失败");
+  }
+});
+
+try {
+  await new Promise<void>((resolve, reject) => {
+    voiceCmdServer.once("error", reject);
+    voiceCmdServer.listen(0, "127.0.0.1", () => {
+      voiceCmdServer.off("error", reject);
+      const addr = voiceCmdServer.address();
+      if (addr && typeof addr === "object") voiceCmdEndpoint = `http://127.0.0.1:${addr.port}/voice-send`;
+      resolve();
+    });
+  });
+  voiceCmdServer.unref();
+  log(`[voice-cmd] 语音命令通道已启动 ${voiceCmdEndpoint}`);
+} catch (err) {
+  log("[voice-cmd] 启动失败（语音工具将不可用）:", err instanceof Error ? err.message : err);
 }
 
 async function replyText(trigger: TriggeredMessage, text: string, turn?: ReplyTurn): Promise<void> {
@@ -639,7 +802,8 @@ async function handleReplyTurn(trigger: TriggeredMessage, turn: ReplyTurn): Prom
     if (!turn.isCurrent()) return cancelled;
     maybeMergeMemories(trigger.userId).catch(() => {});
     const result = await runner.run(prompt, {
-      mode: "web", model: modelRegistry[currentModel], sessionFile: session.file, env: botEnv(),
+      mode: "web", model: modelRegistry[currentModel], sessionFile: session.file,
+      env: { ...botEnv(), ...voiceCmdEnv(trigger, turn) },
       imagePaths: [...imagePaths, ...readyFiles.map((f) => f.path)], signal: turn.signal,
     });
     if (trigger.kind === "group" && normalAtEntry && turn.isCurrent() && result.ok
@@ -660,6 +824,11 @@ async function handleReplyTurn(trigger: TriggeredMessage, turn: ReplyTurn): Prom
   finally { if (pendingByKey.get(ctxKey) === task) pendingByKey.delete(ctxKey); }
   if (!turn.isCurrent()) {
     log(`[modes] 丢弃已失效回复 -> ${ctxKey}`);
+    return;
+  }
+  // 娱乐模式：本轮语音已经发出去了，模型再回「好」之类都不发，避免语音后面多余的一条文字
+  if (turn.entertainment && turn.voiceSent()) {
+    log(`[ent] 本轮已发语音，跳过文字/表情包 -> ${ctxKey}`);
     return;
   }
 
@@ -828,6 +997,8 @@ async function buildPrompt(
     return (
       `[娱乐模式·群聊] 你是 QQ 群「${name ?? trigger.groupId}」里的成员「${config.bot.nickname}」，` +
       `像真实群友一样说话：口语、简短、自然，别像助手或客服，别客套、别用书面语。\n` +
+      `这个群开着语音，你能用 voice_send 工具把要说的话直接读出来发成语音：院长或白名单的人让你「用语音说/发句语音」就直接调它，把要读的原文放进 text，别先写道歉或解释，也别说「我只能打字/我发不了语音」，能不能发以工具返回为准。\n` +
+      `工具返回成功后，本轮就到此为止：不要再发任何文字，也不要发表情包，别再回「好」之类确认——语音本身已经是你的回复。\n` +
       `${MEDIA_CONTEXT_RULES}\n${chatBlock}发言者：${who}${entSaid}${linkBlock}${quoteBlock}` +
       stickerPrompt(stickerLibrary.available(trigger.groupId!))
     );
@@ -840,6 +1011,11 @@ async function buildPrompt(
 
 async function sendSegments(trigger: TriggeredMessage, segs: MessageSegment[], turn?: ReplyTurn): Promise<void> {
   if (turn && !turn.isCurrent()) return;
+  // 本轮语音已发出：娱乐模式不再补发文字/表情包
+  if (turn?.entertainment && turn.voiceSent()) {
+    log(`[send] 本轮已发语音，跳过群 ${trigger.groupId ?? "-"} 的这条消息`);
+    return;
+  }
   const entertainment = turn?.entertainment ?? (trigger.kind === "group" && modes.isEntertainment(trigger.groupId!));
   if (trigger.kind === "private") {
     await client.sendMessage({ message_type: "private", user_id: trigger.userId, message: segs });

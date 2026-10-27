@@ -1,4 +1,8 @@
 import WebSocket from "ws";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { unlinkSync, writeFileSync } from "node:fs";
 
 export type MessageSegment = { type: string; data: Record<string, unknown> };
 
@@ -131,6 +135,33 @@ export class OneBotClient {
     message: MessageSegment[];
   }): Promise<OneBotApiResult> {
     return this.call("send_msg", params as unknown as Record<string, unknown>);
+  }
+
+  /**
+   * 发送群语音（record 段）。正常路径用 base64:// 内联 mp3，不落盘；
+   * 只有明确的 API 拒绝才退回 os.tmpdir 临时文件重试一次，发送后立刻删除。
+   * 连接层超时/断线直接抛出，不做重试（避免不确定是否已送达时重复发送）。
+   */
+  async sendGroupRecord(groupId: string, audio: Buffer): Promise<OneBotApiResult> {
+    const inline = await this.call("send_group_msg", {
+      group_id: groupId,
+      message: [{ type: "record", data: { file: `base64://${audio.toString("base64")}` } }],
+    });
+    if (inline.status === "ok" && inline.retcode === 0) return inline;
+    const file = path.join(tmpdir(), `qq-voice-${randomUUID()}.mp3`);
+    try {
+      writeFileSync(file, audio);
+      return await this.call("send_group_msg", {
+        group_id: groupId,
+        message: [{ type: "record", data: { file } }],
+      });
+    } finally {
+      try {
+        unlinkSync(file);
+      } catch {
+        /* 临时文件清理失败不影响发送结果 */
+      }
+    }
   }
 
   /** 查询群名，失败返回 null。 */
