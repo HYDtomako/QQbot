@@ -60,6 +60,68 @@ npm run selftest:media  # 合成图片、模拟模型和假 OneBot，不连接�
 npm run probe:vision   # 使用真实配置模型，只发送本地生成的几何图，不发送群聊图片
 ```
 
+### 娱乐模式：语音回复（MiniMax TTS / fish.audio）
+
+- 娱乐群里**纯文字的回复**有一部分会改发 QQ 语音（`record` 段）：缺省走 MiniMax T2A v2（`POST {baseUrl}/v1/t2a_v2`，返回 hex 音频），`tts.provider` 设为 `fish` 时改走 fish.audio（`POST {baseUrl}/v1/tts`，返回音频二进制，可用 `tts.proxy` 走本机 socks5）。带表情包或图片的回复保持原样，不转语音；普通模式、私聊完全不受影响。
+- 触发条件同时满足才转：目标群在娱乐模式列表、`tts.enabled` 为 `true`、按 `probability`（默认 `0.35`）随机命中、文本可朗读。
+- 文本过滤：`1 ~ maxChars`（默认 80）字、单段不换行、最多两个句末标点；含代码/反引号、URL、`@`、图片或表情包标记、表格/框线/统计面板符号、符号占比过高的文本都不转，照常发文字。
+- 合成超时 30 秒；音频只在内存里以 `base64://` 发送，不长期落盘（NapCat 明确拒绝内联时才写 `os.tmpdir()` 临时文件重试一次，发送后立即删除）。任何一步失败（超时、非 2xx、状态码非 0、空音频、发送被拒）都**安静降级为原来的文字回复**，不会丢消息、不会抛未捕获异常。日志只记字数、模型、音色和耗时，不记文本全文与密钥。
+
+配置可选（缺 `tts` 段或 `enabled` 不为 `true` 时功能关闭，配置变更需重启桥接）：
+
+```json
+"entertainment": {
+  "tts": {
+    "enabled": true,
+    "provider": "minimax",
+    "proxy": "",
+    "apiKey": "填入你的语音合成密钥（仅本机 config.json）",
+    "baseUrl": "https://api.minimaxi.com",
+    "model": "speech-2.8-turbo",
+    "voiceId": "female-shaonv",
+    "speed": 1,
+    "vol": 1,
+    "pitch": 0,
+    "probability": 0.35,
+    "maxChars": 80,
+    "format": "mp3",
+    "allowOthers": false
+  }
+}
+```
+
+`apiKey` / `baseUrl` 缺失时功能保持关闭，不影响现有文字回复。
+
+```bash
+npm run selftest:tts       # mock fetch 与发送函数，不调用真实 TTS、不发真实 QQ 消息
+npm run selftest:tts-fish  # 假 TTS 与本机 socks5/TLS 假服务，不联网、不上传
+```
+
+### 娱乐模式：让 bot 用语音说（`voice_send` 工具）
+
+除了上面的随机概率钩子，模型还能被**明确要求**时主动发语音：在娱乐模式群里 @ 它说"用语音把课表念一遍""这段话用语音发""你念给我听"，它理解意图后调用 `voice_send`，桥接合成 mp3 并以 `record` 段发到当前群；语音就是这一轮的回复，发完不再补发任何文字或表情包（模型即使回了「好」也会被桥接丢掉）。
+
+- 工具参数：`text`（必填，要朗读的纯口语文字）、`voice`（可选，中文音色名或 voice_id）。桥接还会再清洗一遍 Markdown、代码块和链接；清洗后为空就拒绝。
+- 可用性：**只有娱乐模式群**可用。普通模式群、私聊调用时返回"只有娱乐模式群可以发语音"，不影响正常文字回复。
+- 权限：默认只有院长和 `bot.whitelist` 里的用户能让 bot 发语音，其他人会得到"仅院长可指定语音"。想让群里其他人也能指定，把 `entertainment.tts.allowOthers` 设为 `true`（可选字段，缺省 `false`；不影响概率钩子）。
+- 长度：工具单独限 200 字（`tts.maxChars` 仍是概率钩子的短句阈值），超了返回提示让模型压缩后重试。
+- 音色白名单（中文名或 id 都可以，未命中静默回退 `tts.voiceId`，不会把编造的 id 发到接口）：
+
+  | 中文名 | voice_id | 中文名 | voice_id |
+  | --- | --- | --- | --- |
+  | 少女 | female-shaonv | 青涩青年 | male-qn-qingse |
+  | 御姐 | female-yujie | 精英青年 | male-qn-jingying |
+  | 成熟女性 | female-chengshu | 霸道青年 | male-qn-badao |
+  | 甜美 | female-tianmei | 青年大学生 | male-qn-daxuesheng |
+  | 萌女童 | lovely_girl | 男童 | cute_boy |
+
+- 失败降级：`tts.enabled` 不为 `true`、缺少 `apiKey`/`baseUrl`、合成失败、发送失败或本轮已取消时，工具返回 `ok:false` 和简短原因，模型照常用文字回答；不会重复发送，也不会抛未捕获异常。
+- 桥接路由：工具把 `text`/`voice` 提交给桥接开在 `127.0.0.1` 随机端口的回环通道（`/voice-send`），凭据是每轮临时签发的随机 token；身份（会话、群号、发起人 QQ）由桥接绑定，模型无法指定发到别的群。
+
+```bash
+npm run selftest:voice  # mock fetch + 假 OneBot；不调用真实 TTS、不发真实 QQ 消息
+```
+
 ### 模式切换与内部协议隔离
 
 - 每轮回复固定接收时的模式；真正切换模式后，取消该群仍在生成、排队或摘要中的旧任务。即使随后切回，旧任务也不复活。主动插话、分片发送、图片失败后的文字回退也会复核任务是否仍有效，不影响其他群或私聊；重复设置同一模式不会误取消任务。

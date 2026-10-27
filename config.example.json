@@ -62,6 +62,22 @@
     "replyFrequency": 0.3,
     "media": {
       "enabled": true
+    },
+    "tts": {
+      "enabled": false,
+      "provider": "minimax",
+      "proxy": "",
+      "apiKey": "填入你的语音合成密钥（MiniMax 或 fish.audio；仅本机 config.json，不要提交）",
+      "baseUrl": "https://api.minimaxi.com",
+      "model": "speech-2.8-turbo",
+      "voiceId": "female-shaonv",
+      "speed": 1,
+      "vol": 1,
+      "pitch": 0,
+      "probability": 0.35,
+      "maxChars": 80,
+      "format": "mp3",
+      "allowOthers": false
     }
   },
   "tasks": [

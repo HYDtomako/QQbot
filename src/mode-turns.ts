@@ -3,6 +3,10 @@ export interface ReplyTurn {
   readonly signal: AbortSignal;
   isCurrent(): boolean;
   finish(): void;
+  /** 本回合已成功发出语音：之后的文字/表情包不再补发。 */
+  markVoiceSent(): void;
+  /** 本回合是否已经发过语音。 */
+  voiceSent(): boolean;
 }
 
 /** 切换会永久作废旧 turn；即使模式随后切回，旧 signal 也不会恢复。 */
@@ -16,6 +20,7 @@ export class ModeTurns {
   }
 
   begin(groupId?: string): ReplyTurn {
+    let voiceSent = false;
     const entry = { groupId, controller: new AbortController() };
     const entertainment = groupId !== undefined && this.entertainment(groupId);
     if (this.closed) entry.controller.abort();
@@ -26,6 +31,8 @@ export class ModeTurns {
       isCurrent: () => !this.closed && !entry.controller.signal.aborted
         && (groupId === undefined || entertainment === this.entertainment(groupId)),
       finish: () => { this.active.delete(entry); },
+      markVoiceSent: () => { voiceSent = true; },
+      voiceSent: () => voiceSent,
     };
   }
 
