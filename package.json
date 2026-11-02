@@ -20,7 +20,12 @@
     "selftest:voice": "node scripts/voice-send-selftest.ts && node scripts/voice-bridge-selftest.ts",
     "selftest:redact": "node scripts/redact-selftest.ts",
     "selftest:tell": "node scripts/tell-guga-selftest.ts && node scripts/tell-guga-bridge-selftest.ts",
-    "selftest:mode-manage": "node scripts/mode-manage-selftest.ts && node scripts/mode-manage-bridge-selftest.ts"
+    "selftest:mode-manage": "node scripts/mode-manage-selftest.ts && node scripts/mode-manage-bridge-selftest.ts",
+    "selftest:model": "node scripts/model-manage-selftest.ts",
+    "selftest:send": "node scripts/send-group-selftest.ts",
+    "selftest:memory-identity": "node scripts/memory-identity-selftest.ts",
+    "selftest:task": "node scripts/task-manage-selftest.ts",
+    "selftest:privileged": "node scripts/privileged-bridge-selftest.ts"
   },
   "dependencies": {
     "@napi-rs/canvas": "^1.0.9",

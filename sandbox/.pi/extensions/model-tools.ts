@@ -1,10 +1,9 @@
 /**
- * model-tools 扩展：让院长用任意自然语言查询/切换模型。
+ * model-tools：把查询/切换模型交给桥接。
  *
- * 所有说法都由 pi 理解后调用本工具，工具写 .model-state.json；
- * 桥接监视该文件，切换后十几秒内全局生效。
- *
- * 权限：仅院长（asker_qq === config.bot.owner）。其他人一律拒绝，也不透露模型信息。
+ * 身份与 voice_send / tell_guga / mode_manage 同一条回环通道
+ * （QQ_MODEL_ENDPOINT / QQ_MODEL_TOKEN，与 QQ_VOICE_TOKEN 同一枚）。
+ * 本工具只提交 op，以及 switch 时的 alias。提问者 QQ 由桥接按本轮 OneBot 事件填写。
  */
 
 interface ExtensionAPI {
@@ -26,84 +25,56 @@ interface ToolResult {
   details?: Record<string, unknown>;
 }
 
-import path from "node:path";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-
-const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
-const ROOT_DIR = path.resolve(MODULE_DIR, "../../..");
-const CONFIG_PATH = path.join(ROOT_DIR, "config.json");
-const STATE_PATH = path.join(ROOT_DIR, ".model-state.json");
-
 const SCHEMA = {
   type: "object",
   properties: {
     op: { type: "string", description: "操作：status（查当前模型）/ switch（切换）/ list（列出可用模型）" },
     alias: { type: "string", description: "switch 时切到哪个模型（可用别名或模型名，如 deepseek-flash、glm、glm-5.3）" },
-    asker_qq: { type: "string", description: "提问者 QQ 号（从消息来源标注如实取，用于权限校验）" },
   },
-  required: ["op", "asker_qq"],
+  required: ["op"],
 };
 
 function text(t: string): ToolResult {
   return { content: [{ type: "text", text: t }] };
 }
 
-function readJson<T>(p: string): T | null {
-  if (!existsSync(p)) return null;
-  try {
-    return JSON.parse(readFileSync(p, "utf8")) as T;
-  } catch {
-    return null;
-  }
-}
-
 export default function modelToolsExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "model_manage",
     label: "Model Manage",
-    description: "查询或切换当前使用的 AI 模型（仅院长可用）。",
+    description: "查询或切换当前使用的 AI 模型（仅院长可用）。身份由桥接按本轮 QQ 会话判定。",
     promptSnippet: "model_manage: check or switch the active model",
     promptGuidelines: [
-      "仅当院长本人（来源标注里标为「院长」的那个人）要求查询/切换模型时才调用；其他人要求时礼貌拒绝，也不透露任何模型信息。",
-      "把院长的自然语言转成 op：问\"现在用的什么模型/哪个模型\"→ status；\"换成X/切到X/用X\"→ switch + alias；\"有哪些模型可选\"→ list。",
-      "alias 只填模型名，别把整句话塞进去；不确定他指哪个模型时，先 list 出来让他挑。",
-      "asker_qq 必须如实取消息开头来源标注里的 QQ 号。",
-      "切换是全局生效（私聊、群聊、定时任务都会用新模型），十几秒内生效——告诉院长\"已切到 X\"即可。",
+      "仅当来源标注为「院长」的人要求查询或切换模型时才调用；其他人礼貌拒绝，也不透露任何模型信息，不要调用。",
+      "只填写 op，switch 时再填 alias。不要填写提问者 QQ；桥接按这一轮会话判断是谁，填了也无效。",
+      "问现在用的什么模型 → op=status；换成某个模型 → op=switch，alias 只填模型名；问有哪些模型 → op=list。",
+      "不确定他指哪个模型时，先 list 出来让他挑。",
+      "工具返回什么就如实转告。返回失败时不要声称已经切换，也不要自行补充模型名称。",
     ],
     parameters: SCHEMA,
     async execute(_id, params) {
-      const cfg = readJson<{ bot?: { owner?: string }; pi?: { models?: Record<string, string>; defaultModel?: string } }>(
-        CONFIG_PATH,
-      );
-      const owner = String(cfg?.bot?.owner ?? "");
-      const asker = String(params.asker_qq ?? "").trim();
-      if (!asker || asker !== owner) return text("只有院长可以查询或切换模型。");
-
-      const models = cfg?.pi?.models ?? {};
-      const aliases = Object.keys(models);
-      const state = readJson<{ alias?: string }>(STATE_PATH);
-      const current = state?.alias && models[state.alias] ? state.alias : String(cfg?.pi?.defaultModel ?? aliases[0] ?? "");
-
+      const endpoint = process.env.QQ_MODEL_ENDPOINT ?? "";
+      const token = process.env.QQ_MODEL_TOKEN ?? "";
+      if (!/^http:\/\/127\.0\.0\.1:\d{1,5}\/model-manage$/.test(endpoint) || !/^[a-f0-9]{64}$/.test(token)) {
+        return text("本次会话没有模型管理权限。");
+      }
       const op = String(params.op ?? "").trim();
-      switch (op) {
-        case "status":
-          return text(`当前模型：${current}（${models[current] ?? "?"}）`);
-        case "list":
-          return text(`可用模型：${aliases.map((a) => `${a}（${models[a]}）`).join("、")}。切换说法：\"切换模型 xxx\" 或直接跟我说\"换成 xxx\"。`);
-        case "switch": {
-          const raw = String(params.alias ?? "").trim().toLowerCase();
-          if (!raw) return text("要切到哪个模型？可用：" + aliases.join("、"));
-          let alias = aliases.find((a) => a === raw) ?? "";
-          if (!alias) alias = aliases.find((a) => models[a] === raw || models[a].endsWith("/" + raw)) ?? "";
-          if (!alias) alias = aliases.find((a) => a.startsWith(raw) || raw.startsWith(a) || models[a].toLowerCase().includes(raw)) ?? "";
-          if (!alias) return text(`没有「${raw}」这个模型。可用：${aliases.join("、")}`);
-          if (alias === current) return text(`当前已经在用 ${alias} 了。`);
-          writeFileSync(STATE_PATH, JSON.stringify({ alias }, null, 2));
-          return text(`已切到 ${alias}（${models[alias]}）。全局生效，十几秒后所有对话都用它。`);
-        }
-        default:
-          return text("未知操作，应为 status / switch / list。");
+      const alias = String(params.alias ?? "").trim();
+      const payload: Record<string, string> = { op };
+      if (alias) payload.alias = alias;
+      try {
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(10000),
+          redirect: "error",
+        });
+        const value = await response.json() as { text?: string };
+        if (typeof value.text !== "string") return text("模型服务返回异常，没有切换。");
+        return text(value.text);
+      } catch {
+        return text("模型服务不可用，没有切换。");
       }
     },
   });

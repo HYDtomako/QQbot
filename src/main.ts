@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { mkdirSync, writeFileSync, existsSync, readFileSync, statSync, renameSync, readdirSync, unlinkSync, watchFile } from "node:fs";
+import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync, statSync, renameSync, readdirSync, unlinkSync, watchFile } from "node:fs";
 import { loadConfig } from "./config.ts";
 import { OneBotClient, type MessageSegment } from "./onebot.ts";
 import { matchMessage, type TriggeredMessage } from "./router.ts";
@@ -27,6 +27,11 @@ import { runVoiceSend } from "./voice-tool.ts";
 import { collectSecrets, redactText } from "./redact.ts";
 import { createGugaMailbox, runTellGuga, sessionVia } from "./tell-guga.ts";
 import { runModeManage } from "./mode-tool.ts";
+import { runModelManage } from "./model-tool.ts";
+import { runSendGroup } from "./send-tool.ts";
+import { runMemory } from "./memory-tool.ts";
+import { runTaskManage } from "./task-tool.ts";
+import type { ScheduledTask } from "./tasks.ts";
 
 const log = (...args: unknown[]) => console.log(new Date().toISOString(), ...args);
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -350,6 +355,14 @@ function loadCurrentModel(): string {
 
 let currentModel = loadCurrentModel();
 
+function persistModelAlias(alias: string): void {
+  writeFileSync(modelStatePath, JSON.stringify({ alias }, null, 2));
+  if (modelRegistry[alias]) {
+    currentModel = alias;
+    log(`[model] 已切换 → ${alias}（${modelRegistry[alias]}）`);
+  }
+}
+
 function botEnv(): Record<string, string> {
   return { QQ_BOT_SELF_ID: config.bot.selfId };
 }
@@ -371,8 +384,9 @@ function respondJson(res: ServerResponse, status: number, ok: boolean, text: str
 
 /**
  * 每次进入 pi 前签发一个短期凭据，绑定当前 QQ 会话。
- * voice_send、tell_guga、mode_manage 共用这一份身份：
- * 工具不能改写提问者 QQ。群聊里的目标群也以这份会话为准。
+ * voice_send、tell_guga、mode_manage、model_manage、send_group_message、
+ * remember/recall/forget、task_manage 共用这一份身份：
+ * 工具不能改写提问者 QQ。群聊里 mode_manage 的目标群也以这份会话为准。
  */
 function voiceCmdEnv(trigger: TriggeredMessage, turn: ReplyTurn): Record<string, string> {
   if (!voiceCmdEndpoint) return {};
@@ -392,6 +406,14 @@ function voiceCmdEnv(trigger: TriggeredMessage, turn: ReplyTurn): Record<string,
     QQ_BRIDGE_TOKEN: token,
     QQ_MODE_ENDPOINT: `${base}/mode-manage`,
     QQ_MODE_TOKEN: token,
+    QQ_MODEL_ENDPOINT: `${base}/model-manage`,
+    QQ_MODEL_TOKEN: token,
+    QQ_SEND_ENDPOINT: `${base}/send-group`,
+    QQ_SEND_TOKEN: token,
+    QQ_MEMORY_ENDPOINT: `${base}/memory`,
+    QQ_MEMORY_TOKEN: token,
+    QQ_TASK_ENDPOINT: `${base}/task-manage`,
+    QQ_TASK_TOKEN: token,
   };
 }
 
@@ -470,13 +492,32 @@ async function readJsonBody(
   }
 }
 
+type LoopRoute = "voice" | "tell" | "mode" | "model" | "send" | "memory" | "task";
+
+function loopRoute(url: string | undefined): LoopRoute | null {
+  switch (url) {
+    case "/voice-send": return "voice";
+    case "/tell-guga": return "tell";
+    case "/mode-manage": return "mode";
+    case "/model-manage": return "model";
+    case "/send-group": return "send";
+    case "/memory": return "memory";
+    case "/task-manage": return "task";
+    default: return null;
+  }
+}
+
 const voiceCmdServer = createServer(async (req, res) => {
-  const isVoice = req.url === "/voice-send";
-  const isTell = req.url === "/tell-guga";
-  const isMode = req.url === "/mode-manage";
+  const route = loopRoute(req.url);
   try {
-    if (req.method !== "POST" || (!isVoice && !isTell && !isMode) || req.socket.remoteAddress !== "127.0.0.1") {
-      const forbidden = isMode ? "仅允许本机模式请求" : isTell ? "仅允许本机转达请求" : "仅允许本机语音请求";
+    if (req.method !== "POST" || !route || req.socket.remoteAddress !== "127.0.0.1") {
+      const forbidden = route === "mode" ? "仅允许本机模式请求"
+        : route === "tell" ? "仅允许本机转达请求"
+        : route === "model" ? "仅允许本机模型请求"
+        : route === "send" ? "仅允许本机发群请求"
+        : route === "memory" ? "仅允许本机记忆请求"
+        : route === "task" ? "仅允许本机任务请求"
+        : "仅允许本机语音请求";
       respondJson(res, 403, false, forbidden);
       return;
     }
@@ -488,18 +529,24 @@ const voiceCmdServer = createServer(async (req, res) => {
       respondJson(res, 401, false, "命令凭据已失效，请重新发送请求");
       return;
     }
-    const parsed = await readJsonBody(req, isTell ? 64 * 1024 : 16_384);
+    const parsed = await readJsonBody(req, route === "voice" || route === "mode" ? 16_384 : 64 * 1024);
     if (!parsed.ok) {
       respondJson(res, parsed.status, false, parsed.text);
       return;
     }
     if (!entry.turn.isCurrent()) {
-      const ended = isVoice ? "本轮已结束，语音未发送。" : isTell ? "本轮已结束，没有转达。" : "本轮已结束，没有切换模式。";
+      const ended = route === "voice" ? "本轮已结束，语音未发送。"
+        : route === "tell" ? "本轮已结束，没有转达。"
+        : route === "model" ? "本轮已结束，没有切换模型。"
+        : route === "send" ? "本轮已结束，没有发送。"
+        : route === "memory" ? "本轮已结束，没有处理记忆。"
+        : route === "task" ? "本轮已结束，没有改任务。"
+        : "本轮已结束，没有切换模式。";
       respondJson(res, 409, false, ended);
       return;
     }
     const input = entry.input;
-    if (isMode) {
+    if (route === "mode") {
       // 只取 op / group_id。提问者与群聊目标群以 token 绑定的会话为准。
       const managed = runModeManage({
         asker: input.userId,
@@ -514,7 +561,7 @@ const voiceCmdServer = createServer(async (req, res) => {
       respondJson(res, 200, managed.ok, managed.text);
       return;
     }
-    if (isTell) {
+    if (route === "tell") {
       // 只取 text。提问者、回发目标以 token 绑定的会话为准，忽略正文以外的字段。
       const via = sessionVia(input.kind, input.userId, input.groupId);
       if (!via) {
@@ -533,6 +580,67 @@ const voiceCmdServer = createServer(async (req, res) => {
         { log, writeMailbox: gugaMailbox },
       );
       respondJson(res, 200, told.ok, told.text);
+      return;
+    }
+    if (route === "model") {
+      // 只取 op / alias。提问者以 token 绑定的会话为准，忽略自报的 QQ。
+      const managed = runModelManage({
+        asker: input.userId,
+        owner: config.bot.owner,
+        op: parsed.value.op,
+        alias: parsed.value.alias,
+        models: modelRegistry,
+        defaultModel,
+        current: currentModel,
+      });
+      if (managed.nextAlias) persistModelAlias(managed.nextAlias);
+      respondJson(res, 200, managed.ok, managed.text);
+      return;
+    }
+    if (route === "send") {
+      // 只取 text / group_id。提问者以 token 绑定的会话为准。
+      const sent = runSendGroup({
+        asker: input.userId,
+        owner: config.bot.owner,
+        text: parsed.value.text,
+        groupId: parsed.value.group_id,
+        defaultGroup: config.bot.defaultGroup,
+      });
+      if (sent.message) enqueueGroupMessage(sent.message.group_id, sent.message.text);
+      respondJson(res, 200, sent.ok, sent.text);
+      return;
+    }
+    if (route === "memory") {
+      // 只取 op 和业务字段。档案按 token 绑定的 QQ 打开，忽略自报的号码。
+      const remembered = runMemory({
+        asker: input.userId,
+        owner: config.bot.owner,
+        op: parsed.value.op,
+        text: parsed.value.text,
+        pinned: parsed.value.pinned,
+        query: parsed.value.query,
+        target: parsed.value.target,
+      }, longTermDir);
+      respondJson(res, 200, remembered.ok, remembered.text);
+      return;
+    }
+    if (route === "task") {
+      // 只取任务字段。提问者以 token 绑定的会话为准；私聊目标写成院长 QQ。
+      const fresh = JSON.parse(readFileSync(path.join(root, "config.json"), "utf8")) as { tasks?: ScheduledTask[] };
+      const managed = runTaskManage({
+        asker: input.userId,
+        owner: config.bot.owner,
+        op: parsed.value.op,
+        name: parsed.value.name,
+        time: parsed.value.time,
+        at: parsed.value.at,
+        target: parsed.value.target,
+        groupId: parsed.value.group_id,
+        days: parsed.value.days,
+        prompt: parsed.value.prompt,
+      }, Array.isArray(fresh.tasks) ? fresh.tasks : []);
+      if (managed.next) commitTasks(managed.next);
+      respondJson(res, 200, managed.ok, managed.text);
       return;
     }
     const groupId = input.kind === "group" ? String(input.groupId ?? "").trim() : "";
@@ -560,9 +668,16 @@ const voiceCmdServer = createServer(async (req, res) => {
     if (result.ok) entry.turn.markVoiceSent();
     respondJson(res, 200, result.ok, result.text);
   } catch (err) {
-    const route = isMode ? "mode" : isTell ? "tell" : "voice-cmd";
-    log(`[${route}] 处理失败:`, err instanceof Error ? err.message : err);
-    respondJson(res, 500, false, isMode ? "模式切换失败" : isTell ? "转达失败" : "语音命令处理失败");
+    const label = route ?? "voice-cmd";
+    log(`[${label}] 处理失败:`, err instanceof Error ? err.message : err);
+    const failed = route === "mode" ? "模式切换失败"
+      : route === "tell" ? "转达失败"
+      : route === "model" ? "模型切换失败"
+      : route === "send" ? "发群失败"
+      : route === "memory" ? "记忆处理失败"
+      : route === "task" ? "任务修改失败"
+      : "语音命令处理失败";
+    respondJson(res, 500, false, failed);
   }
 });
 
@@ -581,8 +696,12 @@ try {
   log(`[voice-cmd] 语音命令通道已启动 ${voiceCmdEndpoint}`);
   log(`[tell] 转达通道已启动 ${bridgeBase}/tell-guga`);
   log(`[mode] 模式通道已启动 ${bridgeBase}/mode-manage`);
+  log(`[model] 模型通道已启动 ${bridgeBase}/model-manage`);
+  log(`[send] 发群通道已启动 ${bridgeBase}/send-group`);
+  log(`[memory] 记忆通道已启动 ${bridgeBase}/memory`);
+  log(`[task] 任务通道已启动 ${bridgeBase}/task-manage`);
 } catch (err) {
-  log("[voice-cmd] 启动失败（语音、转达与模式工具将不可用）:", err instanceof Error ? err.message : err);
+  log("[voice-cmd] 启动失败（语音、转达、模式、模型、发群、记忆与任务工具将不可用）:", err instanceof Error ? err.message : err);
 }
 
 async function replyText(trigger: TriggeredMessage, text: string, turn?: ReplyTurn): Promise<void> {
@@ -702,7 +821,16 @@ const taskScheduler = new TaskScheduler(
 );
 taskScheduler.start();
 
-// 监视 .model-state.json：pi 的 model_manage 工具切换模型后 → 热更新当前模型
+function commitTasks(next: ScheduledTask[]): void {
+  const configPath = path.join(root, "config.json");
+  const fresh = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
+  fresh.tasks = next;
+  writeFileSync(configPath, JSON.stringify(fresh, null, 2) + "\n");
+  config.tasks = next as typeof config.tasks;
+  taskScheduler.setTasks(next);
+}
+
+// 监视 .model-state.json：桥接写入后这里兜底；外部改文件同样热更新当前模型
 watchFile(modelStatePath, { interval: 2000 }, () => {
   try {
     const saved = JSON.parse(readFileSync(modelStatePath, "utf8")).alias;
@@ -724,7 +852,7 @@ watchFile(modesPath, { interval: 2000 }, () => {
   }
 });
 
-// 监视 config.json：task_manage 工具（pi 内）写入的任务变更 → 热更新调度器
+// 监视 config.json：本进程的 task_manage 会直接改调度器；外部改文件时这里热更新
 watchFile(path.join(root, "config.json"), { interval: 2000 }, () => {
   try {
     const fresh = JSON.parse(readFileSync(path.join(root, "config.json"), "utf8"));
@@ -1336,8 +1464,13 @@ async function maybeMergeMemories(userId: string): Promise<void> {
   }
 }
 
-// ── 发件箱：pi 的 send_group_message 工具写入，桥接每 3 秒取出并真发到群 ──
+// ── 发件箱：send_group_message 由桥接写入，每 3 秒取出并真发到群 ──
 const outboxPath = path.join(root, "memory", "outbox.jsonl");
+
+function enqueueGroupMessage(groupId: string, body: string): void {
+  mkdirSync(path.dirname(outboxPath), { recursive: true });
+  appendFileSync(outboxPath, JSON.stringify({ t: new Date().toISOString(), group_id: groupId, text: body }) + "\n");
+}
 
 async function flushOutbox(): Promise<void> {
   if (!existsSync(outboxPath)) return;
