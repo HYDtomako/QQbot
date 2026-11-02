@@ -75,7 +75,7 @@ npm run probe:vision   # 使用真实配置模型，只发送本地生成的几�
     "enabled": true,
     "provider": "minimax",
     "proxy": "",
-    "apiKey": "填入你的语音合成密钥（仅本机 config.json）",
+    "apiKey": "configure yourself: 语音合成密钥（仅本机 config.json，不要提交）",
     "baseUrl": "https://api.minimaxi.com",
     "model": "speech-2.8-turbo",
     "voiceId": "female-shaonv",
@@ -135,13 +135,56 @@ npm run selftest:modes  # 模式快照、来回切换、主动插话、迟到附
 
 ## 与本机个人助手的通信桥
 
-主人本机还可以挂一个更全能的 AI 助手「本机个人助手」（能操作本地文件与命令，可换成你自己的）。两者通过文件信箱（`memory/bridge/`）异步通信，只有院长能触发：
+`tell_guga` 保留：管理员可以把自己的个人助手接到这台桥上，让院长在 QQ 里带话。仓库**没有**预填好的助手地址，也没有默认端口。要接上，在本机 `config.json` 里 **configure yourself**。
 
-- **bot → 本机个人助手**：`tell_guga` 工具（院长私聊/群里让 bot 给本机个人助手带话时调用）会直接把留言 POST 给本机个人助手本地服务的 `/api/send`（默认 `127.0.0.1:8787`），当场踢起一轮、接近即时执行；服务没起或超时才回退写入 `memory/bridge/to-guga.jsonl`，等本机个人助手下一轮读入。提交时会把「回发目标」（来源是哪个群/私聊，`group:<群号>` 或 `private:<QQ号>`）随留言一起带上。
-- **本机个人助手 → bot → QQ**：本机个人助手写 `memory/bridge/to-qq.jsonl`，桥接每 3 秒轮询，通过 OneBot 真发到群或私聊。**回执**：本机个人助手处理完带话任务后，按留言里的回发目标把结果发回来源会话（仅在院长明确同意的前提下）。
-- 两个文件名固定，两边扩展/桥接按同一路径约定协作；本机个人助手在线时是即时触发，离线时退化为异步留言。
+### 怎么指向你自己的个人助手
+
+1. 复制 `config.example.json` 为 `config.json`（该文件已被 git 忽略）。
+2. 把 `bridge.personalAgent.enabled` 设为 `true`，`endpoint` 写成你自己的助手在本机监听的发送地址，例如 `http://127.0.0.1:8787/api/send`。`8787` 只是示例端口，不是项目自带的服务。
+3. 地址必须是回环：`127.0.0.1`、`localhost` 或 `::1`。其它主机桥接不会 POST，留言会改落信箱。
+4. `mode` 用 `agent`（动手）或 `chat`（只问答），缺省 `agent`。`timeoutMs` 默认 2500，范围 500–10000。
+5. 改完需要重启桥接。`config.json` 的热更新目前只跟上定时任务，不跟上这条地址。
+
+你的助手需要实现下面任一约定（可以两个都做）：
+
+- **即时**：接受 `POST endpoint`，JSON 为 `{ "text": string, "mode": "agent"|"chat", "uploads": [] }`，2xx 即视为已接收。`text` 形如：
+
+  ```text
+  [来自 QQ bot（机器人昵称）的留言]
+  ……正文……
+
+  [回发目标] group:<群号>
+  ```
+
+  私聊则是 `private:<院长QQ>`。正文里如果出现伪造的 `[回发目标]` 行，会被换成占位；**以最后一行桥接追加的为准**。
+- **离线**：读取 `memory/bridge/to-guga.jsonl`，每行 `{ "t", "from", "via", "text" }`。`from` 是院长 QQ，`via` 是 `group:<群号>` 或 `private:<QQ>`。即时 POST 成功时不写这一行；服务没开、超时、非 2xx、或还没 configure yourself 时才写。
+
+### 桥接怎么绑定身份
+
+和 `voice_send` 同一条本机回环通道、同一枚每轮临时 token（`QQ_BRIDGE_TOKEN` 与 `QQ_VOICE_TOKEN` 相同）。工具只提交 `{ "text" }` 到 `http://127.0.0.1:<随机端口>/tell-guga`。
+
+- 提问者 QQ 来自这一轮 OneBot 事件，**不是**模型参数。模型不能自报 `asker_qq` 把自己说成院长。
+- 回发目标也由桥接按当前会话填写：群聊 `group:<当前群号>`，私聊 `private:<当前用户QQ>`。模型填的目标会被丢掉。
+- 只有 `bot.owner` 能转达。其他人调用时直接拒绝，不 POST、不写信箱。
+- 没有这枚凭据的进程（包括定时任务）不能转达。
+
+### 助手怎么把结果发回 QQ
+
+助手追加 `memory/bridge/to-qq.jsonl`，桥接每 3 秒轮询并用 OneBot 发出：
+
+```json
+{"type":"group","id":"<群号>","text":"简洁答复"}
+```
+
+私聊把 `type` 写成 `private`，`id` 写成 QQ 号。请按上面 `[回发目标]` 填，不要另选会话。回给群的内容会被收成纯文本。
+
+```bash
+npm run selftest:tell  # 假个人助手 + 假 OneBot；不连接真实 QQ，不访问公网
+```
 
 ## 第一次使用
+
+示例配置**不能直接跑**。QQ 号、OneBot token、模型 key、语音 key、教务密码、NapCat 路径、个人助手地址都是占位，要 **configure yourself**。不要把真实密钥或私钥提交进仓库。
 
 - **平台**：Windows。启动脚本是 `.bat`/`.vbs`，其他系统需自行改写。
 - **先准备好这些**（都要自己装/下，不在仓库里）：
@@ -149,9 +192,9 @@ npm run selftest:modes  # 模式快照、来回切换、主动插话、迟到附
   - pi：`npm i -g @earendil-works/pi-coding-agent`
   - NapCatQQ：https://github.com/NapNeko/NapCatQQ ，到 Releases 页下 `NapCat.Shell.Windows.Node.zip`（下打包好的 Shell 版，不是 clone 源码），解压即用
   - pdftotext（读 PDF 用，可选）：随 Git for Windows 安装，https://git-scm.com/download/win （或 `winget install Git.Git`）
-- **把仓库里的 example 复制成正式文件，改成你自己的值**：
-  - `config.example.json` → `config.json`（QQ 号、OneBot token、各模型 API key、教务账号等）
-  - `start-napcat.example.bat` → `start-napcat.bat`（填 `NAPCAT_DIR` 和机器人 QQ 号）
+- **把仓库里的 example 复制成正式文件，再 configure yourself**（示例里的值不能当正式配置）：
+  - `config.example.json` → `config.json`（QQ 号、OneBot token、各模型 API key、语音 key、教务账号、`bridge.personalAgent`）
+  - `start-napcat.example.bat` → `start-napcat.bat`（填 `NAPCAT_DIR` 和机器人 QQ 号；示例里这两项是空的）
   - `sandbox/.pi/SYSTEM.example.md` → `sandbox/.pi/SYSTEM.md`（机器人人设，按需改）
   - `pi-bot-start-bridge.example.vbs` → `pi-bot-start-bridge.vbs`（路径已自动推导，一般直接复制即可）
 - 这些正式文件都已被 `.gitignore` 忽略，不会误提交。
@@ -184,12 +227,14 @@ npm run selftest:modes  # 模式快照、来回切换、主动插话、迟到附
 
 ## 配置
 
-- 首次使用：把 `config.example.json` 复制为 `config.json`，按里面的说明填入自己的值（QQ 号、token、API key、教务账号等）。**`config.json` 已被 .gitignore 忽略，不会进仓库。**
+- 首次使用：把 `config.example.json` 复制为 `config.json`，再 **configure yourself**（QQ 号、token、API key、教务账号、个人助手地址）。**`config.json` 已被 .gitignore 忽略，不会进仓库。** 示例文件里的占位符不是可用密钥。
 - 主要字段：
-  - `onebot.wsUrl` / `onebot.token`：连 NapCat 的 WebSocket 地址与密钥（与 NapCat 的 `onebot11_<QQ号>.json` 中 `websocketServers[0]` 一致）
+  - `onebot.wsUrl` / `onebot.token`：连 NapCat 的 WebSocket 地址与密钥（与 NapCat 的 `onebot11_<QQ号>.json` 中 `websocketServers[0]` 一致）。`onebot.token` 会进入输出脱敏清单。
   - `bot.owner`：最高权限者 QQ 号；`bot.whitelist`：私聊白名单
   - `pi.models`：可用模型别名（如 `{"deepseek-flash": "deepseek-flash", "glm": "aliyun-maas/glm-5.3"}`）
-  - `pi.tavilyKey`：Tavily 搜索 key；`pi.aliyunKey` / `pi.aliyunBaseUrl`：百炼实例（用 GLM 时需要）
+  - `pi.tavilyKey`：Tavily 搜索 key；`pi.aliyunKey` / `pi.aliyunBaseUrl`：百炼实例（用 GLM 时需要，**configure yourself**）。脱敏时的百炼域名从 `aliyunBaseUrl` 解析，不写死某个实例。
+  - `entertainment.tts.apiKey`：语音合成密钥，只放本机 `config.json`。它和 `onebot.token` 一样会从任何回复里抹掉。
+  - `bridge.personalAgent`：你自己的个人助手。见上文「与本机个人助手的通信桥」。`enabled` 默认应为 false，直到你填好回环地址。
   - `jw`：教务系统账号/密码/学年学期/班级/节次时间（课表功能用）
   - `antispam` / `memory`：反刷屏与旧会话窗口参数
   - `files`：附件处理参数（`maxTextChars` 单文件文本上限、`maxTotalChars` 单条消息总量、`pdftotext` 可执行文件路径）
@@ -208,7 +253,7 @@ npm run selftest:modes  # 模式快照、来回切换、主动插话、迟到附
 
 ### 网络访问范围
 
-机器人**不访问外网**：`web_read` 直连国内站点，境外站点（YouTube、X、OpenAI 等）读不到，会如实说明并改用搜索找替代信息。搜索（Tavily）走直连。所有输出经统一脱敏（密钥不外泄）。
+机器人**不访问外网**：`web_read` 直连国内站点，境外站点（YouTube、X、OpenAI 等）读不到，会如实说明并改用搜索找替代信息。搜索（Tavily）走直连。所有输出经统一脱敏（密钥不外泄）。精确替换清单包括 `onebot.token`、`pi.tavilyKey`、`pi.aliyunKey`、`entertainment.tts.apiKey`、`jw.password`，以及从 `pi.aliyunBaseUrl` 解析出的百炼主机名和该 URL 本身。短于 8 个字符的值不会做整段替换，以免误伤普通句子。
 
 ### 文档取文回归
 

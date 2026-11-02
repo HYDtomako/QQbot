@@ -17,7 +17,9 @@
     "selftest:pa-format": "node scripts/pa-format-selftest.ts",
     "selftest:tts": "node scripts/tts-selftest.ts",
     "selftest:tts-fish": "node scripts/tts-fish-selftest.ts",
-    "selftest:voice": "node scripts/voice-send-selftest.ts && node scripts/voice-bridge-selftest.ts"
+    "selftest:voice": "node scripts/voice-send-selftest.ts && node scripts/voice-bridge-selftest.ts",
+    "selftest:redact": "node scripts/redact-selftest.ts",
+    "selftest:tell": "node scripts/tell-guga-selftest.ts && node scripts/tell-guga-bridge-selftest.ts"
   },
   "dependencies": {
     "@napi-rs/canvas": "^1.0.9",
