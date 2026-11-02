@@ -1,9 +1,10 @@
 /**
  * voice-tools 扩展：让模型在娱乐模式群里把一段话合成语音发到当前群。
  *
- * 机制（与 mode_manage 同一套桥接路由）：工具把 text/voice 提交给桥接开在本机的
- * 回环 HTTP 通道（/voice-send），由桥接判定会话模式与权限，再调 MiniMax 合成、
- * 用 OneBot 的 record 段发到当前群。工具本身不接触 OneBot 连接，也不读密钥。
+ * 机制：工具把 text/voice 提交给桥接开在本机的回环 HTTP 通道（/voice-send）。
+ * 每轮临时 token 绑定当前 QQ 会话；tell_guga 走 /tell-guga，mode_manage 走 /mode-manage，三者同一枚 token。
+ * 桥接判定会话模式与权限，再调 MiniMax 合成、用 OneBot 的 record 段发到当前群。
+ * 工具本身不接触 OneBot 连接，也不读密钥。
  *
  * 权限由桥接侧强制（当前回合是否娱乐模式群、发起人是否院长/白名单/allowOthers）。
  */

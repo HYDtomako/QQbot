@@ -1,18 +1,13 @@
 /**
- * bridge-tools 扩展：与「本机个人助手」（院长本机的 AI 助手，D:\pi-agent）通信。
+ * bridge-tools：把一条留言交给桥接，由桥接转给管理员自己的个人助手。
  *
- * 机制（文件信箱，异步、互不阻塞）：
- *   - 本工具默认把留言追加到 memory/bridge/to-guga.jsonl；本机个人助手的扩展在它每轮
- *     对话开始前读取该文件并把内容注入上下文（异步：得等它下一轮才处理）。
- *   - 若本机个人助手的本地服务正在跑（默认 127.0.0.1:8787），本工具会直接 POST
- *     /api/send 把留言踢成一轮——此时不用等院长在页面上说话，接近即时执行。
- *     POST 不通（服务没起 / 超时）才回退到文件信箱，保证留言不丢。
- *   - 反过来，本机个人助手写 memory/bridge/to-qq.jsonl，桥接（src/main.ts）每 3 秒轮询
- *     并通过 OneBot 真发到 QQ。
- *   - 回执：本工具会把「回发目标」（这条留言来自哪个群/私聊）随留言一起带给
- *     本机个人助手；它处理完成后按该目标把结果回发到 QQ，院长就能在 QQ 里看到收尾。
+ * 身份与 voice_send 同一条回环通道：桥接每轮把 QQ 会话绑进临时凭据
+ * （QQ_BRIDGE_ENDPOINT / QQ_BRIDGE_TOKEN，与 QQ_VOICE_TOKEN 同一枚）。
+ * 本工具只提交 text。提问者是谁、回发到哪个会话，由桥接按 OneBot 事件填写；
+ * 模型参数里即使带了别的字段也不会被转发。
  *
- * 权限：仅院长（asker_qq === config.bot.owner）。其他人一律拒绝。
+ * 个人助手的地址不在这里写死。管理员在 config.json 的 bridge.personalAgent
+ * 里 configure yourself（只接受本机回环）。即时推送失败时桥接改写信箱。
  */
 
 interface ExtensionAPI {
@@ -34,111 +29,62 @@ interface ToolResult {
   details?: Record<string, unknown>;
 }
 
-import path from "node:path";
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-
-const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
-const ROOT_DIR = path.resolve(MODULE_DIR, "../../..");
-const CONFIG_PATH = path.join(ROOT_DIR, "config.json");
-const BRIDGE_DIR = path.join(ROOT_DIR, "memory", "bridge");
-const TO_GUGA = path.join(BRIDGE_DIR, "to-guga.jsonl");
+/** 与 src/tell-guga.ts 的 TELL_MAX_CHARS 保持一致。 */
 const MAX_TEXT_LEN = 4000;
-
-// 本机个人助手本地服务（pi-agent）：把留言直接踢成一轮，接近即时执行。
-// 地址与端口要与 D:\pi-agent 的 config.json 里 gui.host / gui.port 一致。
-const GUGA_ENDPOINT = "http://127.0.0.1:8787/api/send";
-// 触发用什么模式："agent"=动手模式（能读写文件、跑命令），"chat"=问答模式（只查答）。
-// QQ 带话多数是要干活的，所以默认动手；想更保守改成 "chat"。
-const GUGA_TRIGGER_MODE: "agent" | "chat" = "agent";
-const GUGA_PUSH_TIMEOUT_MS = 2500;
-
-/** 尝试把留言推给本机个人助手的本地服务；成功返回 true。失败静默，由调用方回退到文件。 */
-async function pushToGuga(body: string, via: string): Promise<boolean> {
-  try {
-    const res = await fetch(GUGA_ENDPOINT, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        text: `[来自 QQ bot（企鹅主任）的留言]\n${body}\n\n[回发目标] ${via}`,
-        mode: GUGA_TRIGGER_MODE,
-        uploads: [],
-      }),
-      signal: AbortSignal.timeout(GUGA_PUSH_TIMEOUT_MS),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
 
 const SCHEMA = {
   type: "object",
   properties: {
     text: {
       type: "string",
-      description: "要转达给本机个人助手的完整内容（对它的留言，不是给用户看的）。本机个人助手看不到 QQ 群聊，请写清背景与要它做什么。",
-    },
-    asker_qq: { type: "string", description: "提问者 QQ 号（从消息来源标注如实取，用于权限校验）" },
-    via: {
-      type: "string",
-      description:
-        "这条留言来自哪个会话，本机个人助手据此把处理结果回发过来。群聊填 group:<群号>，私聊填 private:<QQ号>。从消息来源标注如实取。",
+      description: "要转达给本机个人助手的完整内容（对它的留言，不是给用户看的）。它看不到 QQ 群聊，请写清背景与要它做什么。不要填写提问者或回发目标。",
     },
   },
-  required: ["text", "asker_qq", "via"],
+  required: ["text"],
 };
+
+function text(t: string): ToolResult {
+  return { content: [{ type: "text", text: t }] };
+}
 
 export default function bridgeToolsExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "tell_guga",
     label: "Tell Guga",
-    description: "把一条留言转达给院长本机的 AI 助手「本机个人助手」（会直接推给它即时处理，服务不在线时落盘等它下次读）。",
-    promptSnippet: "tell_guga: relay a message to the owner's local assistant 本机个人助手",
+    description: "把一条留言转达给管理员本机的个人助手。只有院长可以触发；身份由桥接按本轮 QQ 会话判定。",
+    promptSnippet: "tell_guga: relay a message to the owner's own local personal agent",
     promptGuidelines: [
-      "仅当院长本人（来源标注里标为「院长」的那个人）让你给「本机个人助手」带话、转达、交代事情时调用；其他人一律拒绝。",
-      "本机个人助手是院长电脑上的本地助手，看不到 QQ 群聊；text 里要写清完整背景与院长要它做什么。",
-      "这是即时转达：本工具会直接把留言推给本机个人助手开始处理，院长不用再在它页面上另发消息。",
-      "asker_qq 必须如实取消息开头来源标注里的 QQ 号。",
-      "via 必须如实填这条留言来自哪个会话：群聊填 group:<群号>，私聊填 private:<QQ号>（从来源标注取）。本机个人助手处理完会把结果回发到这里。",
-      "回发是给 QQ 里的人看的：只转发它针对原问题的简洁答复（结论与要点、纯文本），别把工作报告、查证过程或文件路径原样转过来。",
+      "仅当来源标注为「院长」的人让你给本机个人助手带话、转达、交代事情时调用；其他人一律拒绝，不要调用。",
+      "只填写 text。不要填写提问者 QQ、群号或回发目标；桥接会按这一轮 QQ 会话绑定，模型填了也无效。",
+      "个人助手是管理员自己在本机配置的程序，看不到 QQ 群聊；text 里写清背景和要它做什么。",
+      "它不在任何群里，不要把它当群友去翻名册。",
+      "工具返回什么就如实转告。返回失败时不要声称已经转达。",
+      "回发是给 QQ 里的人看的：只转发它针对原问题的简洁答复，别把工作报告、查证过程或文件路径原样转过来。",
     ],
     parameters: SCHEMA,
     async execute(_id, params) {
-      const asker = String(params.asker_qq ?? "").trim();
-      let owner = "";
-      try {
-        owner = String(JSON.parse(readFileSync(CONFIG_PATH, "utf8"))?.bot?.owner ?? "");
-      } catch {
-        return text("读取配置失败，暂时无法转达。");
+      const endpoint = process.env.QQ_BRIDGE_ENDPOINT ?? "";
+      const token = process.env.QQ_BRIDGE_TOKEN ?? "";
+      if (!/^http:\/\/127\.0\.0\.1:\d{1,5}\/tell-guga$/.test(endpoint) || !/^[a-f0-9]{64}$/.test(token)) {
+        return text("本次会话没有转达权限，没有提交给本机个人助手。");
       }
-      if (!asker || asker !== owner) return text("只有院长可以让我给本机个人助手带话。");
-
       const body = String(params.text ?? "").trim();
       if (!body) return text("要转达的内容为空。");
       if (body.length > MAX_TEXT_LEN) return text(`内容太长（${body.length} 字），请压缩到 ${MAX_TEXT_LEN} 字以内。`);
-
-      // 回发目标：优先用传入的 via；缺失时兜底发给院长私聊，保证回执有去处。
-      const via = String(params.via ?? "").trim() || (owner ? `private:${owner}` : "默认群");
-
-      // 优先直接踢起本机个人助手的一轮；服务不在线才落盘等它下次读。
-      const pushed = await pushToGuga(body, via);
-      if (!pushed) {
-        mkdirSync(BRIDGE_DIR, { recursive: true });
-        appendFileSync(
-          TO_GUGA,
-          JSON.stringify({ t: new Date().toISOString(), from: asker, via, text: body }) + "\n",
-        );
+      try {
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+          body: JSON.stringify({ text: body }),
+          signal: AbortSignal.timeout(20000),
+          redirect: "error",
+        });
+        const value = await response.json() as { text?: string };
+        if (typeof value.text !== "string") return text("转达服务返回异常，没有提交成功。");
+        return text(value.text);
+      } catch {
+        return text("转达服务不可用，没有提交给本机个人助手。");
       }
-      return text(
-        pushed
-          ? `已转达给本机个人助手，正在处理（${body.length} 字）。它处理完会把结果回发到本会话。`
-          : `已转达给本机个人助手（${body.length} 字，它下次运行时处理）。它处理完会把结果回发到本会话。`,
-      );
     },
   });
-}
-
-function text(t: string): ToolResult {
-  return { content: [{ type: "text", text: t }] };
 }

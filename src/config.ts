@@ -56,6 +56,20 @@ export interface BotConfig {
     target: { type: "group" | "private"; id: string };
     prompt: string;
   }>;
+  /**
+   * 与本机个人助手的桥。endpoint 必须自己配置，只接受本机回环地址；
+   * 不填或 enabled 不为 true 时，tell_guga 只把留言写进 memory/bridge/to-guga.jsonl。
+   */
+  bridge?: {
+    personalAgent?: {
+      enabled?: boolean;
+      /** configure yourself：例如 http://127.0.0.1:8787/api/send。不要写公网地址。 */
+      endpoint?: string;
+      /** agent = 动手模式，chat = 只问答。缺省 agent。 */
+      mode?: "agent" | "chat";
+      timeoutMs?: number;
+    };
+  };
   /** 娱乐模式（主动插话）：只对 modes.json 里开了娱乐模式的群生效 */
   entertainment?: {
     /** 目标回复频率 0~1，越小越少主动开口，默认 0.3 */
