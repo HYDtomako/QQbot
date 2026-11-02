@@ -161,12 +161,14 @@ npm run selftest:modes  # 模式快照、来回切换、主动插话、迟到附
 
 ### 桥接怎么绑定身份
 
-和 `voice_send` 同一条本机回环通道、同一枚每轮临时 token（`QQ_BRIDGE_TOKEN` 与 `QQ_VOICE_TOKEN` 相同）。工具只提交 `{ "text" }` 到 `http://127.0.0.1:<随机端口>/tell-guga`。
+和 `voice_send`、`mode_manage` 同一条本机回环通道、同一枚每轮临时 token（`QQ_BRIDGE_TOKEN`、`QQ_MODE_TOKEN` 与 `QQ_VOICE_TOKEN` 相同）。`tell_guga` 只提交 `{ "text" }` 到 `http://127.0.0.1:<随机端口>/tell-guga`。
 
 - 提问者 QQ 来自这一轮 OneBot 事件，**不是**模型参数。模型不能自报 `asker_qq` 把自己说成院长。
 - 回发目标也由桥接按当前会话填写：群聊 `group:<当前群号>`，私聊 `private:<当前用户QQ>`。模型填的目标会被丢掉。
 - 只有 `bot.owner` 能转达。其他人调用时直接拒绝，不 POST、不写信箱。
 - 没有这枚凭据的进程（包括定时任务）不能转达。
+
+`mode_manage` 把 `{ "op": "status"|"on"|"off" }` 提交到同端口的 `/mode-manage`。私聊可以再带 `group_id`；群聊的目标群以这轮会话为准，模型另报的群号不会生效。只有 `bot.owner` 能改 `modes.json`。不是院长时不写文件。
 
 ### 助手怎么把结果发回 QQ
 

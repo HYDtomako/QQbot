@@ -26,6 +26,7 @@ import { trySendVoice } from "./tts.ts";
 import { runVoiceSend } from "./voice-tool.ts";
 import { collectSecrets, redactText } from "./redact.ts";
 import { createGugaMailbox, runTellGuga, sessionVia } from "./tell-guga.ts";
+import { runModeManage } from "./mode-tool.ts";
 
 const log = (...args: unknown[]) => console.log(new Date().toISOString(), ...args);
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -370,8 +371,8 @@ function respondJson(res: ServerResponse, status: number, ok: boolean, text: str
 
 /**
  * 每次进入 pi 前签发一个短期凭据，绑定当前 QQ 会话。
- * voice_send（/voice-send）和 tell_guga（/tell-guga）共用这一份身份：
- * 工具只能提交文本，不能改写提问者 QQ 或回发目标。
+ * voice_send、tell_guga、mode_manage 共用这一份身份：
+ * 工具不能改写提问者 QQ。群聊里的目标群也以这份会话为准。
  */
 function voiceCmdEnv(trigger: TriggeredMessage, turn: ReplyTurn): Record<string, string> {
   if (!voiceCmdEndpoint) return {};
@@ -389,7 +390,58 @@ function voiceCmdEnv(trigger: TriggeredMessage, turn: ReplyTurn): Record<string,
     QQ_VOICE_TOKEN: token,
     QQ_BRIDGE_ENDPOINT: `${base}/tell-guga`,
     QQ_BRIDGE_TOKEN: token,
+    QQ_MODE_ENDPOINT: `${base}/mode-manage`,
+    QQ_MODE_TOKEN: token,
   };
+}
+
+/** 本轮 mode_manage 算出的新 modes.json。回复发出后再落盘，避免把当前回合立刻判失效。 */
+let pendingModesJson: string | null = null;
+
+function readModesRaw(): Record<string, unknown> | null {
+  if (pendingModesJson !== null) {
+    try {
+      const staged = JSON.parse(pendingModesJson) as unknown;
+      if (staged && typeof staged === "object" && !Array.isArray(staged)) return staged as Record<string, unknown>;
+    } catch { /* 改读磁盘 */ }
+  }
+  try {
+    if (!existsSync(modesPath)) return null;
+    const parsed = JSON.parse(readFileSync(modesPath, "utf8")) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+  } catch { /* 损坏按空 */ }
+  return null;
+}
+
+function stageModes(next: Record<string, unknown>): void {
+  pendingModesJson = JSON.stringify(next, null, 2) + "\n";
+}
+
+function syncModesFromDisk(): void {
+  const before = new Set(modes.listEntertainment());
+  modes.reload();
+  const after = new Set(modes.listEntertainment());
+  let changed = false;
+  for (const gid of new Set([...before, ...after])) {
+    if (before.has(gid) === after.has(gid)) continue;
+    changed = true;
+    modeTurns.invalidate(gid);
+    entStates.delete(gid);
+    if (!after.has(gid)) mediaContext.cancelGroup(gid);
+  }
+  if (changed) log(`[modes] 娱乐模式配置变更 → 已开启：${[...after].join("、") || "无"}`);
+}
+
+function commitModes(): void {
+  if (pendingModesJson === null) return;
+  const body = pendingModesJson;
+  pendingModesJson = null;
+  try {
+    writeFileSync(modesPath, body);
+    syncModesFromDisk();
+  } catch (err) {
+    log("[modes] 写入失败:", err instanceof Error ? err.message : err);
+  }
 }
 
 const gugaMailbox = createGugaMailbox(path.join(root, "memory", "bridge"));
@@ -421,9 +473,11 @@ async function readJsonBody(
 const voiceCmdServer = createServer(async (req, res) => {
   const isVoice = req.url === "/voice-send";
   const isTell = req.url === "/tell-guga";
+  const isMode = req.url === "/mode-manage";
   try {
-    if (req.method !== "POST" || (!isVoice && !isTell) || req.socket.remoteAddress !== "127.0.0.1") {
-      respondJson(res, 403, false, isTell ? "仅允许本机转达请求" : "仅允许本机语音请求");
+    if (req.method !== "POST" || (!isVoice && !isTell && !isMode) || req.socket.remoteAddress !== "127.0.0.1") {
+      const forbidden = isMode ? "仅允许本机模式请求" : isTell ? "仅允许本机转达请求" : "仅允许本机语音请求";
+      respondJson(res, 403, false, forbidden);
       return;
     }
     const auth = req.headers.authorization;
@@ -440,10 +494,26 @@ const voiceCmdServer = createServer(async (req, res) => {
       return;
     }
     if (!entry.turn.isCurrent()) {
-      respondJson(res, 409, false, isVoice ? "本轮已结束，语音未发送。" : "本轮已结束，没有转达。");
+      const ended = isVoice ? "本轮已结束，语音未发送。" : isTell ? "本轮已结束，没有转达。" : "本轮已结束，没有切换模式。";
+      respondJson(res, 409, false, ended);
       return;
     }
     const input = entry.input;
+    if (isMode) {
+      // 只取 op / group_id。提问者与群聊目标群以 token 绑定的会话为准。
+      const managed = runModeManage({
+        asker: input.userId,
+        owner: config.bot.owner,
+        kind: input.kind,
+        sessionGroupId: input.groupId,
+        defaultGroup: config.bot.defaultGroup,
+        op: parsed.value.op,
+        groupId: parsed.value.group_id,
+      }, readModesRaw());
+      if (managed.next) stageModes(managed.next);
+      respondJson(res, 200, managed.ok, managed.text);
+      return;
+    }
     if (isTell) {
       // 只取 text。提问者、回发目标以 token 绑定的会话为准，忽略正文以外的字段。
       const via = sessionVia(input.kind, input.userId, input.groupId);
@@ -490,8 +560,9 @@ const voiceCmdServer = createServer(async (req, res) => {
     if (result.ok) entry.turn.markVoiceSent();
     respondJson(res, 200, result.ok, result.text);
   } catch (err) {
-    log(`[${isTell ? "tell" : "voice-cmd"}] 处理失败:`, err instanceof Error ? err.message : err);
-    respondJson(res, 500, false, isTell ? "转达失败" : "语音命令处理失败");
+    const route = isMode ? "mode" : isTell ? "tell" : "voice-cmd";
+    log(`[${route}] 处理失败:`, err instanceof Error ? err.message : err);
+    respondJson(res, 500, false, isMode ? "模式切换失败" : isTell ? "转达失败" : "语音命令处理失败");
   }
 });
 
@@ -506,10 +577,12 @@ try {
     });
   });
   voiceCmdServer.unref();
+  const bridgeBase = voiceCmdEndpoint.replace(/\/voice-send$/, "");
   log(`[voice-cmd] 语音命令通道已启动 ${voiceCmdEndpoint}`);
-  log(`[tell] 转达通道已启动 ${voiceCmdEndpoint.replace(/\/voice-send$/, "/tell-guga")}`);
+  log(`[tell] 转达通道已启动 ${bridgeBase}/tell-guga`);
+  log(`[mode] 模式通道已启动 ${bridgeBase}/mode-manage`);
 } catch (err) {
-  log("[voice-cmd] 启动失败（语音与转达工具将不可用）:", err instanceof Error ? err.message : err);
+  log("[voice-cmd] 启动失败（语音、转达与模式工具将不可用）:", err instanceof Error ? err.message : err);
 }
 
 async function replyText(trigger: TriggeredMessage, text: string, turn?: ReplyTurn): Promise<void> {
@@ -642,19 +715,10 @@ watchFile(modelStatePath, { interval: 2000 }, () => {
   }
 });
 
-// 监视 modes.json：pi 的 mode_manage 工具开关娱乐模式后 → 热更新内存状态
+// 监视 modes.json：外部改文件时热更新。本进程的 mode_manage 在回复发出后自己提交。
 watchFile(modesPath, { interval: 2000 }, () => {
   try {
-    const before = new Set(modes.listEntertainment());
-    modes.reload();
-    const after = new Set(modes.listEntertainment());
-    for (const gid of new Set([...before, ...after])) {
-      if (before.has(gid) === after.has(gid)) continue;
-      modeTurns.invalidate(gid);
-      entStates.delete(gid);
-      if (!after.has(gid)) mediaContext.cancelGroup(gid);
-    }
-    log(`[modes] 检测到娱乐模式配置变更 → 已开启：${[...after].join("、") || "无"}`);
+    syncModesFromDisk();
   } catch {
     /* 文件半写入状态等下次触发 */
   }
@@ -814,7 +878,12 @@ async function handleReplyTurn(trigger: TriggeredMessage, turn: ReplyTurn): Prom
   const ctxKey = trigger.kind === "group" ? `group-${trigger.groupId}` : `user-${trigger.userId}`;
   const sessionKey = trigger.kind === "group" ? groupSessionKey(trigger.groupId!, turn.entertainment) : ctxKey;
   const prev = pendingByKey.get(ctxKey) ?? Promise.resolve();
-  const task = prev.catch(() => undefined).then(async () => {
+  // 精确的开关句要能插到同群正在生成的任务前面，否则关不掉当前这一轮。
+  // 改模式仍只发生在 mode_manage 工具里，身份用本轮回环凭据，不在这里判断权限。
+  const gate = /^(?:开启|关闭)娱乐模式$/.test(trigger.text.trim())
+    ? Promise.resolve()
+    : prev.catch(() => undefined);
+  const task = gate.then(async () => {
     if (!turn.isCurrent()) return cancelled;
     if (turn.entertainment && !trigger.images?.length) {
       await waitForRecentMedia(trigger.groupId!, trigger.userId);
@@ -858,6 +927,7 @@ async function handleReplyTurn(trigger: TriggeredMessage, turn: ReplyTurn): Prom
     return result;
   });
   pendingByKey.set(ctxKey, task);
+  try {
   let result: PiResult;
   try { result = await task; }
   finally { if (pendingByKey.get(ctxKey) === task) pendingByKey.delete(ctxKey); }
@@ -940,6 +1010,10 @@ async function handleReplyTurn(trigger: TriggeredMessage, turn: ReplyTurn): Prom
   for (const segs of chunks) {
     if (!turn.isCurrent()) return;
     await sendSegments(trigger, segs, turn).catch((err) => log("[send] 失败:", err.message));
+  }
+  } finally {
+    // 模式文件在回复判定之后再生效，当前这条确认仍按切换前的回合发出。
+    commitModes();
   }
 }
 

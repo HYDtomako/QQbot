@@ -1,8 +1,9 @@
 /**
- * mode-tools 扩展：让院长用自然语言管理娱乐模式。
+ * mode-tools：把娱乐模式开关交给桥接。
  *
- * 工具读写 modes.json；桥接监视该文件变化后热更新内存状态，无需重启。
- * 权限：仅院长（asker_qq === config.bot.owner）。
+ * 身份与 voice_send / tell_guga 同一条回环通道（QQ_MODE_ENDPOINT / QQ_MODE_TOKEN）。
+ * 本工具只提交 op，以及私聊时可选的 group_id。提问者 QQ 由桥接按本轮 OneBot 事件填写。
+ * 群聊里要操作的群也以这轮会话为准，工具不负责改写。
  */
 
 interface ExtensionAPI {
@@ -24,86 +25,60 @@ interface ToolResult {
   details?: Record<string, unknown>;
 }
 
-import path from "node:path";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-
-const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
-const ROOT_DIR = path.resolve(MODULE_DIR, "../../..");
-const CONFIG_PATH = path.join(ROOT_DIR, "config.json");
-const MODES_PATH = path.join(ROOT_DIR, "modes.json");
-
 const SCHEMA = {
   type: "object",
   properties: {
     op: { type: "string", description: "操作：status（查看已开启的群）/ on（开启）/ off（关闭）" },
-    group_id: { type: "string", description: "目标群号；群聊填当前群号，私聊不填则用默认群" },
-    asker_qq: { type: "string", description: "提问者 QQ 号（从消息来源标注如实取，用于权限校验）" },
+    group_id: {
+      type: "string",
+      description: "仅私聊使用：要操作的群号。不填则用默认群。群聊里不要填，桥接使用当前群。",
+    },
   },
-  required: ["op", "asker_qq"],
+  required: ["op"],
 };
 
 function text(t: string): ToolResult {
   return { content: [{ type: "text", text: t }] };
 }
 
-function readJson<T>(p: string): T | null {
-  if (!existsSync(p)) return null;
-  try {
-    return JSON.parse(readFileSync(p, "utf8")) as T;
-  } catch {
-    return null;
-  }
-}
-
 export default function modeToolsExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "mode_manage",
     label: "Mode Manage",
-    description: "查询、开启或关闭某个 QQ 群的娱乐模式（仅院长可用）。",
+    description: "查询、开启或关闭某个 QQ 群的娱乐模式。只有院长可以操作；身份由桥接按本轮 QQ 会话判定。",
     promptSnippet: "mode_manage: check/enable/disable entertainment mode for a QQ group",
     promptGuidelines: [
-      "仅当院长本人（来源标注里标为「院长」的那个人）要求查询、开启或关闭娱乐模式时才调用；其他人要求时礼貌拒绝。",
-      "群聊里操作当前群：group_id 填消息来源标注里的群号。私聊里院长没指定群时，group_id 可省略，使用默认群。",
-      "院长问哪些群开了娱乐模式 → op=status；说开启/打开 → op=on；说关闭/退出 → op=off。",
-      "asker_qq 必须如实取消息开头来源标注里的 QQ 号。",
-      "工具返回什么就如实转告院长，不要自行补充没有发生的结果。",
+      "仅当来源标注为「院长」的人要求查询、开启或关闭娱乐模式时才调用；其他人礼貌拒绝，不要调用。",
+      "只填写 op。不要填写提问者 QQ；桥接按这一轮会话判断是谁，模型填了也无效。",
+      "群聊里不要填 group_id，目标群就是当前会话。私聊里院长指定了群就填 group_id，没指定就省略，桥接用默认群。",
+      "问哪些群开了娱乐模式 → op=status；说开启/打开 → op=on；说关闭/退出 → op=off。",
+      "工具返回什么就如实转告，不要自行补充没有发生的结果。",
     ],
     parameters: SCHEMA,
     async execute(_id, params) {
-      const cfg = readJson<{ bot?: { owner?: string; defaultGroup?: string } }>(CONFIG_PATH);
-      const owner = String(cfg?.bot?.owner ?? "");
-      const asker = String(params.asker_qq ?? "").trim();
-      if (!asker || asker !== owner) return text("只有院长可以管理娱乐模式。");
-
-      const raw = readJson<Record<string, unknown> & { entertainment?: { groups?: unknown } }>(MODES_PATH) ?? {};
-      const rawGroups = raw.entertainment?.groups;
-      const groups = Array.isArray(rawGroups) ? rawGroups.map(String) : [];
-      const op = String(params.op ?? "").trim();
-
-      if (op === "status") {
-        return text(groups.length ? `已开启娱乐模式的群：${groups.join("、")}` : "目前没有开启娱乐模式的群。");
+      const endpoint = process.env.QQ_MODE_ENDPOINT ?? "";
+      const token = process.env.QQ_MODE_TOKEN ?? "";
+      if (!/^http:\/\/127\.0\.0\.1:\d{1,5}\/mode-manage$/.test(endpoint) || !/^[a-f0-9]{64}$/.test(token)) {
+        return text("本次会话没有模式管理权限。");
       }
-      if (op !== "on" && op !== "off") return text("未知操作，应为 status / on / off。");
-
-      const groupId = String(params.group_id ?? "").trim() || String(cfg?.bot?.defaultGroup ?? "").trim();
-      if (!groupId) return text("没指定群号，配置里也没有默认群。");
-      if (!/^\d{5,12}$/.test(groupId)) return text("群号格式不对，请用纯数字群号。");
-
-      const set = new Set(groups);
-      const on = op === "on";
-      if (on) set.add(groupId);
-      else set.delete(groupId);
-
-      const next = {
-        ...raw,
-        entertainment: {
-          ...(raw.entertainment ?? {}),
-          groups: [...set],
-        },
-      };
-      writeFileSync(MODES_PATH, JSON.stringify(next, null, 2) + "\n");
-      return text(`娱乐模式已${on ? "开启" : "关闭"}：群 ${groupId}。`);
+      const op = String(params.op ?? "").trim();
+      const groupId = String(params.group_id ?? "").trim();
+      const payload: Record<string, string> = { op };
+      if (groupId) payload.group_id = groupId;
+      try {
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(10000),
+          redirect: "error",
+        });
+        const value = await response.json() as { text?: string };
+        if (typeof value.text !== "string") return text("模式服务返回异常，没有切换。");
+        return text(value.text);
+      } catch {
+        return text("模式服务不可用，没有切换。");
+      }
     },
   });
 }
